@@ -1,0 +1,9 @@
+node_modules/
+target/
+*.node
+native.js
+native.d.ts
+dist/
+coverage/
+*.tgz
+.DS_Store
