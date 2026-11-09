@@ -50,7 +50,24 @@ pub struct DecodedImage {
     pub rgba: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct ImageInfo {
+    pub width: u32,
+    pub height: u32,
+    pub format: &'static str,
+    pub orientation: u8,
+}
+
 impl DecodedImage {
+    pub fn into_oriented(self, orientation: u8) -> RenderResult<Self> {
+        let (rgba, width, height) = orient_rgba(self.rgba, self.width, self.height, orientation);
+        Ok(Self {
+            width,
+            height,
+            rgba,
+        })
+    }
+
     pub fn into_pixmap(mut self) -> RenderResult<Pixmap> {
         let size = IntSize::from_wh(self.width, self.height)
             .ok_or_else(|| RenderError::internal("invalid decoded image size"))?;
@@ -60,7 +77,7 @@ impl DecodedImage {
     }
 }
 
-pub fn decode_image(data: &[u8], limits: ImageLimits) -> RenderResult<DecodedImage> {
+fn validate_encoded(data: &[u8]) -> RenderResult<()> {
     if data.is_empty() {
         return Err(RenderError::image("image data is empty"));
     }
@@ -70,20 +87,102 @@ pub fn decode_image(data: &[u8], limits: ImageLimits) -> RenderResult<DecodedIma
             data.len()
         )));
     }
+    Ok(())
+}
 
-    if data.starts_with(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]) {
-        return decode_png(data, limits);
+fn is_png(data: &[u8]) -> bool {
+    data.starts_with(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a])
+}
+
+fn is_jpeg(data: &[u8]) -> bool {
+    data.starts_with(&[0xff, 0xd8, 0xff])
+}
+
+fn is_webp(data: &[u8]) -> bool {
+    data.len() >= 12 && &data[0..4] == b"RIFF" && &data[8..12] == b"WEBP"
+}
+
+pub fn decode_image_raw(data: &[u8], limits: ImageLimits) -> RenderResult<(DecodedImage, u8)> {
+    validate_encoded(data)?;
+
+    if is_png(data) {
+        return Ok((decode_png(data, limits)?, 1));
     }
-    if data.starts_with(&[0xff, 0xd8, 0xff]) {
+    if is_jpeg(data) {
         return decode_jpeg(data, limits);
     }
-    if data.len() >= 12 && &data[0..4] == b"RIFF" && &data[8..12] == b"WEBP" {
-        return decode_webp(data, limits);
+    if is_webp(data) {
+        return Ok((decode_webp(data, limits)?, 1));
     }
 
     Err(RenderError::image(
         "unsupported image format; expected PNG, JPEG or WebP",
     ))
+}
+
+pub fn decode_image(data: &[u8], limits: ImageLimits) -> RenderResult<DecodedImage> {
+    let (image, orientation) = decode_image_raw(data, limits)?;
+    image.into_oriented(orientation)
+}
+
+pub fn probe_image(data: &[u8]) -> RenderResult<ImageInfo> {
+    validate_encoded(data)?;
+
+    if is_png(data) {
+        let (width, height) = probe_png(data)?;
+        return Ok(ImageInfo {
+            width,
+            height,
+            format: "png",
+            orientation: 1,
+        });
+    }
+    if is_jpeg(data) {
+        let (width, height, orientation) = probe_jpeg(data)?;
+        return Ok(ImageInfo {
+            width,
+            height,
+            format: "jpeg",
+            orientation,
+        });
+    }
+    if is_webp(data) {
+        let (width, height) = probe_webp(data)?;
+        return Ok(ImageInfo {
+            width,
+            height,
+            format: "webp",
+            orientation: 1,
+        });
+    }
+
+    Err(RenderError::image(
+        "unsupported image format; expected PNG, JPEG or WebP",
+    ))
+}
+
+fn probe_png(data: &[u8]) -> RenderResult<(u32, u32)> {
+    use zune_png::PngDecoder;
+    use zune_png::zune_core::bytestream::ZCursor;
+    use zune_png::zune_core::options::DecoderOptions;
+
+    let options = DecoderOptions::default();
+    let mut decoder = PngDecoder::new_with_options(ZCursor::new(data), options);
+    decoder
+        .decode_headers()
+        .map_err(|error| RenderError::image(format!("PNG header error: {error}")))?;
+
+    let (width, height) = decoder
+        .dimensions()
+        .ok_or_else(|| RenderError::image("PNG header has no dimensions"))?;
+    let width = u32::try_from(width)
+        .map_err(|_| RenderError::image_too_large("PNG width does not fit u32"))?;
+    let height = u32::try_from(height)
+        .map_err(|_| RenderError::image_too_large("PNG height does not fit u32"))?;
+    if width == 0 || height == 0 {
+        return Err(RenderError::image("image has zero dimensions"));
+    }
+    Ok((width, height))
 }
 
 fn decode_png(data: &[u8], limits: ImageLimits) -> RenderResult<DecodedImage> {
@@ -150,7 +249,36 @@ fn decode_png(data: &[u8], limits: ImageLimits) -> RenderResult<DecodedImage> {
     })
 }
 
-fn decode_jpeg(data: &[u8], limits: ImageLimits) -> RenderResult<DecodedImage> {
+fn probe_jpeg(data: &[u8]) -> RenderResult<(u32, u32, u8)> {
+    use zune_jpeg::JpegDecoder;
+    use zune_jpeg::zune_core::bytestream::ZCursor;
+    use zune_jpeg::zune_core::options::DecoderOptions;
+
+    let options = DecoderOptions::default();
+    let mut decoder = JpegDecoder::new_with_options(ZCursor::new(data), options);
+    decoder
+        .decode_headers()
+        .map_err(|error| RenderError::image(format!("JPEG header error: {error}")))?;
+
+    let info = decoder
+        .info()
+        .ok_or_else(|| RenderError::image("JPEG header has no dimensions"))?;
+    let width = u32::from(info.width);
+    let height = u32::from(info.height);
+    if width == 0 || height == 0 {
+        return Err(RenderError::image("image has zero dimensions"));
+    }
+    let orientation = decoder
+        .exif()
+        .map_or(1, |exif| parse_exif_orientation(exif));
+    Ok(if swaps_dimensions(orientation) {
+        (height, width, orientation)
+    } else {
+        (width, height, orientation)
+    })
+}
+
+fn decode_jpeg(data: &[u8], limits: ImageLimits) -> RenderResult<(DecodedImage, u8)> {
     use zune_jpeg::JpegDecoder;
     use zune_jpeg::zune_core::bytestream::ZCursor;
     use zune_jpeg::zune_core::colorspace::ColorSpace;
@@ -168,6 +296,9 @@ fn decode_jpeg(data: &[u8], limits: ImageLimits) -> RenderResult<DecodedImage> {
     let width = u32::from(info.width);
     let height = u32::from(info.height);
     limits.check(width, height)?;
+    let orientation = decoder
+        .exif()
+        .map_or(1, |exif| parse_exif_orientation(exif));
 
     let rgba = decoder
         .decode()
@@ -178,11 +309,26 @@ fn decode_jpeg(data: &[u8], limits: ImageLimits) -> RenderResult<DecodedImage> {
         ));
     }
 
-    Ok(DecodedImage {
-        width,
-        height,
-        rgba,
-    })
+    Ok((
+        DecodedImage {
+            width,
+            height,
+            rgba,
+        },
+        orientation,
+    ))
+}
+
+fn probe_webp(data: &[u8]) -> RenderResult<(u32, u32)> {
+    use image_webp::WebPDecoder;
+
+    let decoder = WebPDecoder::new(Cursor::new(data))
+        .map_err(|error| RenderError::image(format!("WebP header error: {error}")))?;
+    let (width, height) = decoder.dimensions();
+    if width == 0 || height == 0 {
+        return Err(RenderError::image("image has zero dimensions"));
+    }
+    Ok((width, height))
 }
 
 fn decode_webp(data: &[u8], limits: ImageLimits) -> RenderResult<DecodedImage> {
@@ -220,6 +366,102 @@ fn decode_webp(data: &[u8], limits: ImageLimits) -> RenderResult<DecodedImage> {
         height,
         rgba,
     })
+}
+
+fn swap_u16(data: &[u8], offset: usize, little_endian: bool) -> Option<u16> {
+    let bytes = data.get(offset..offset + 2)?;
+    Some(if little_endian {
+        u16::from_le_bytes([bytes[0], bytes[1]])
+    } else {
+        u16::from_be_bytes([bytes[0], bytes[1]])
+    })
+}
+
+fn swap_u32(data: &[u8], offset: usize, little_endian: bool) -> Option<u32> {
+    let bytes = data.get(offset..offset + 4)?;
+    Some(if little_endian {
+        u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+    } else {
+        u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+    })
+}
+
+pub fn parse_exif_orientation(data: &[u8]) -> u8 {
+    let little_endian = match data.get(0..2) {
+        Some(b"II") => true,
+        Some(b"MM") => false,
+        _ => return 1,
+    };
+    if swap_u16(data, 2, little_endian) != Some(42) {
+        return 1;
+    }
+    let Some(ifd_offset) = swap_u32(data, 4, little_endian).map(|value| value as usize) else {
+        return 1;
+    };
+    let Some(count) = swap_u16(data, ifd_offset, little_endian) else {
+        return 1;
+    };
+    for index in 0..usize::from(count) {
+        let entry = ifd_offset + 2 + index * 12;
+        if swap_u16(data, entry, little_endian) != Some(0x0112) {
+            continue;
+        }
+        let kind = swap_u16(data, entry + 2, little_endian);
+        let value = match kind {
+            Some(3) => swap_u16(data, entry + 8, little_endian).map(|value| value as u32),
+            Some(4) => swap_u32(data, entry + 8, little_endian),
+            _ => None,
+        };
+        return match value {
+            Some(value @ 1..=8) => value as u8,
+            _ => 1,
+        };
+    }
+    1
+}
+
+pub(crate) fn swaps_dimensions(orientation: u8) -> bool {
+    matches!(orientation, 5..=8)
+}
+
+pub(crate) fn orient_rgba(
+    rgba: Vec<u8>,
+    width: u32,
+    height: u32,
+    orientation: u8,
+) -> (Vec<u8>, u32, u32) {
+    if !(2..=8).contains(&orientation) {
+        return (rgba, width, height);
+    }
+    let (out_width, out_height) = if swaps_dimensions(orientation) {
+        (height, width)
+    } else {
+        (width, height)
+    };
+    let mut output = vec![0_u8; rgba.len()];
+    let source_stride = width as usize * 4;
+    let target_stride = out_width as usize * 4;
+
+    for y in 0..height as usize {
+        let row = y * source_stride;
+        for x in 0..width as usize {
+            let (target_x, target_y) = match orientation {
+                2 => (width as usize - 1 - x, y),
+                3 => (width as usize - 1 - x, height as usize - 1 - y),
+                4 => (x, height as usize - 1 - y),
+                5 => (y, x),
+                6 => (height as usize - 1 - y, x),
+                7 => (height as usize - 1 - y, width as usize - 1 - x),
+                8 => (y, width as usize - 1 - x),
+                _ => (x, y),
+            };
+            let source = row + x * 4;
+            let target = target_y * target_stride + target_x * 4;
+            output[target..target + 4].copy_from_slice(&rgba[source..source + 4]);
+        }
+    }
+
+    (output, out_width, out_height)
 }
 
 fn premultiply(rgba: &mut [u8]) {
@@ -307,5 +549,32 @@ mod tests {
         assert!(limits.check(100, 101).is_err());
         assert!(limits.check(0, 10).is_err());
         assert!(limits.check(100, 100).is_ok());
+    }
+
+    #[test]
+    fn reads_exif_orientation() {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"MM");
+        data.extend_from_slice(&42_u16.to_be_bytes());
+        data.extend_from_slice(&8_u32.to_be_bytes());
+        data.extend_from_slice(&1_u16.to_be_bytes());
+        data.extend_from_slice(&0x0112_u16.to_be_bytes());
+        data.extend_from_slice(&3_u16.to_be_bytes());
+        data.extend_from_slice(&1_u32.to_be_bytes());
+        data.extend_from_slice(&6_u16.to_be_bytes());
+        data.extend_from_slice(&0_u16.to_be_bytes());
+        data.extend_from_slice(&0_u32.to_be_bytes());
+        assert_eq!(parse_exif_orientation(&data), 6);
+    }
+
+    #[test]
+    fn orients_pixels() {
+        let pixels = vec![1, 0, 0, 255, 2, 0, 0, 255, 3, 0, 0, 255, 4, 0, 0, 255];
+        let (rotated, width, height) = orient_rgba(pixels, 2, 2, 6);
+        assert_eq!((width, height), (2, 2));
+        assert_eq!(
+            rotated,
+            vec![3, 0, 0, 255, 1, 0, 0, 255, 4, 0, 0, 255, 2, 0, 0, 255]
+        );
     }
 }

@@ -43,6 +43,11 @@ impl RenderError {
     }
 
     #[must_use]
+    pub fn jpeg(message: impl Into<String>) -> Self {
+        Self::new("JPEG_ENCODE", message)
+    }
+
+    #[must_use]
     pub fn internal(message: impl Into<String>) -> Self {
         Self::new("INTERNAL", message)
     }

@@ -32,4 +32,7 @@ pub struct SceneData {
     pub avatar: Option<Vec<u8>>,
     pub avatar_ellipse: Option<EllipseData>,
     pub texts: Vec<TextSpecData>,
+    pub format: Option<String>,
+    pub quality: Option<u32>,
+    pub strict_background: bool,
 }

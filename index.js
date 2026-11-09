@@ -1,13 +1,30 @@
 import { readFile } from "node:fs/promises";
 
-import { NativeWelcomeRenderer } from "./native.js";
+let NativeWelcomeRenderer;
+let nativeNormalizeImage;
+let nativeProbeImage;
+let nativeLoadError;
+
+try {
+  const native = await import("./native.js");
+  NativeWelcomeRenderer = native.NativeWelcomeRenderer;
+  nativeNormalizeImage = native.normalizeImage;
+  nativeProbeImage = native.probeImage;
+} catch (error) {
+  nativeLoadError = error;
+}
 
 const ERROR_CODE = /^\[([A-Z_]+)\]\s+(.*)$/s;
+
+function nativeUnavailable() {
+  const detail = nativeLoadError instanceof Error ? nativeLoadError.message : String(nativeLoadError ?? "native addon is unavailable");
+  return new RenderError("NATIVE_LOAD", `native addon is unavailable: ${detail}`, { cause: nativeLoadError });
+}
 
 function normalizeScene(scene) {
   if (!scene || typeof scene !== "object") return scene;
   const normalized = { ...scene };
-  for (const key of ["background", "avatar", "overlay", "avatarEllipse", "backgroundKey"]) {
+  for (const key of ["background", "avatar", "overlay", "avatarEllipse", "backgroundKey", "format", "quality", "strictBackground"]) {
     if (normalized[key] == null) delete normalized[key];
   }
   if (Array.isArray(normalized.texts)) {
@@ -57,6 +74,7 @@ export class WelcomeRenderer {
   #native;
 
   constructor(fonts, options) {
+    if (!NativeWelcomeRenderer) throw nativeUnavailable();
     if (!fonts || !fonts.regular) {
       throw new RenderError("INVALID_ARGUMENT", "regular font data is required");
     }
@@ -76,6 +94,7 @@ export class WelcomeRenderer {
     maxDimension,
     maxPixels,
   }) {
+    if (!NativeWelcomeRenderer) throw nativeUnavailable();
     if (!regular) {
       throw new RenderError("INVALID_ARGUMENT", "regular font path is required");
     }
@@ -133,6 +152,24 @@ export class WelcomeRenderer {
 
   [Symbol.dispose]() {
     this.dispose();
+  }
+}
+
+export function probeImage(data) {
+  if (!nativeProbeImage) throw nativeUnavailable();
+  try {
+    return nativeProbeImage(data);
+  } catch (error) {
+    throw toRenderError(error);
+  }
+}
+
+export async function normalizeImage(data, options) {
+  if (!nativeNormalizeImage) throw nativeUnavailable();
+  try {
+    return await nativeNormalizeImage(data, options);
+  } catch (error) {
+    throw toRenderError(error);
   }
 }
 

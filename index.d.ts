@@ -23,6 +23,33 @@ export interface FromFilesOptions extends RendererOptions {
   fallback?: (string | URL)[] | undefined;
 }
 
+export type ImageFormat = "png" | "jpeg" | "webp";
+
+export interface ImageInfo {
+  width: number;
+  height: number;
+  format: ImageFormat;
+  orientation: number;
+}
+
+export interface NormalizeImageOptions {
+  maxDimension?: number | undefined;
+  maxPixels?: number | undefined;
+  format?: "png" | "jpeg" | "jpg" | undefined;
+  quality?: number | undefined;
+  background?: string | undefined;
+}
+
+export interface NormalizedImage {
+  data: Buffer;
+  width: number;
+  height: number;
+  format: "png" | "jpeg";
+  originalWidth: number;
+  originalHeight: number;
+  orientation: number;
+}
+
 export interface Overlay {
   color: string;
   opacity: number;
@@ -59,6 +86,9 @@ export interface Scene {
   avatar?: Buffer | null | undefined;
   avatarEllipse?: Ellipse | null | undefined;
   texts: TextSpec[];
+  format?: "png" | "jpeg" | "jpg" | undefined;
+  quality?: number | undefined;
+  strictBackground?: boolean | undefined;
 }
 
 export interface RenderStats {
@@ -67,7 +97,16 @@ export interface RenderStats {
   cacheMisses: number;
   cacheBytes: number;
   cacheEntries: number;
+  backgroundFailures: number;
+  avatarFailures: number;
 }
+
+export function probeImage(data: Buffer): ImageInfo;
+
+export function normalizeImage(
+  data: Buffer,
+  options?: NormalizeImageOptions,
+): Promise<NormalizedImage>;
 
 export class RenderError extends Error {
   readonly code: string;

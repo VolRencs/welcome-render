@@ -1,6 +1,6 @@
 {
   "name": "welcome-render",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "Native scene compositor for GOPlay welcome images",
   "license": "GPL-3.0-only",

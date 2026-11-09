@@ -10,7 +10,8 @@ use crate::color::ColorU8;
 use crate::error::{RenderError, RenderResult};
 use crate::font::FontStore;
 use crate::image::{DecodedImage, ImageLimits, decode_image};
-use crate::png_encode::encode_rgb_png;
+use crate::normalize::OutputFormat;
+use crate::png_encode::{encode_rgb_jpeg_pixmap, encode_rgb_png_pixmap};
 use crate::scene::{EllipseData, SceneData};
 use crate::text::TextEngine;
 
@@ -43,6 +44,8 @@ pub struct RendererStats {
     pub cache_misses: u64,
     pub cache_bytes: u64,
     pub cache_entries: u64,
+    pub background_failures: u64,
+    pub avatar_failures: u64,
 }
 
 pub struct RendererInner {
@@ -51,6 +54,8 @@ pub struct RendererInner {
     cache: PixmapCache,
     limits: ImageLimits,
     renders: AtomicU64,
+    background_failures: AtomicU64,
+    avatar_failures: AtomicU64,
 }
 
 impl RendererInner {
@@ -67,6 +72,8 @@ impl RendererInner {
             cache: PixmapCache::new(options.cache_bytes),
             limits: options.limits,
             renders: AtomicU64::new(0),
+            background_failures: AtomicU64::new(0),
+            avatar_failures: AtomicU64::new(0),
         })
     }
 
@@ -83,23 +90,23 @@ impl RendererInner {
         // When the caller knows the canvas size, a warm cache hit must not decode
         // the background at all. Without explicit dimensions we have to decode it
         // to discover the size.
-        let (width, height, mut background, mut background_failed) =
+        let (width, height, mut background, mut background_failed, mut background_error) =
             match (scene.width, scene.height) {
-                (Some(width), Some(height)) => (width, height, None, false),
+                (Some(width), Some(height)) => (width, height, None, false, None),
                 (None, None) => {
-                    let (decoded, failed) = match scene.background.as_deref() {
+                    let (decoded, failed, error) = match scene.background.as_deref() {
                         Some(data) => match decode_image(data, self.limits) {
-                            Ok(background) => (Some(background), false),
-                            Err(_) => (None, true),
+                            Ok(background) => (Some(background), false, None),
+                            Err(error) => (None, true, Some(error)),
                         },
-                        None => (None, false),
+                        None => (None, false, None),
                     };
                     let dimensions = decoded
                         .as_ref()
                         .map_or((DESIGN_WIDTH, DESIGN_HEIGHT), |background| {
                             (background.width, background.height)
                         });
-                    (dimensions.0, dimensions.1, decoded, failed)
+                    (dimensions.0, dimensions.1, decoded, failed, error)
                 }
                 _ => {
                     return Err(RenderError::invalid(
@@ -118,6 +125,13 @@ impl RendererInner {
             self.limits.max_pixels,
         );
 
+        if background_failed {
+            self.background_failures.fetch_add(1, Ordering::Relaxed);
+            if scene.strict_background {
+                return Err(strict_background_error(scene, background_error));
+            }
+        }
+
         let (overlay_color, overlay_opacity) = overlay_params(scene)?;
         let cache_key = base_cache_key(scene, width, height, overlay_color, overlay_opacity);
 
@@ -132,7 +146,14 @@ impl RendererInner {
                 {
                     match decode_image(data, self.limits) {
                         Ok(decoded) => background = Some(decoded),
-                        Err(_) => background_failed = true,
+                        Err(error) => {
+                            background_failed = true;
+                            background_error = Some(error);
+                            self.background_failures.fetch_add(1, Ordering::Relaxed);
+                            if scene.strict_background {
+                                return Err(strict_background_error(scene, background_error));
+                            }
+                        }
                     }
                 }
                 let built = Arc::new(self.build_base(
@@ -155,16 +176,19 @@ impl RendererInner {
 
         if let Some(avatar) = scene.avatar.as_deref()
             && let Some(ellipse) = scene.avatar_ellipse
+            && self.draw_avatar(&mut canvas, avatar, ellipse).is_err()
         {
-            // A broken avatar must not prevent the welcome card from rendering.
-            let _ = self.draw_avatar(&mut canvas, avatar, ellipse);
+            self.avatar_failures.fetch_add(1, Ordering::Relaxed);
         }
 
         for text in &scene.texts {
             self.text.draw_text(&self.fonts, &mut canvas, text)?;
         }
 
-        encode_rgb_png(&canvas)
+        match output_format(scene)? {
+            OutputFormat::Png => encode_rgb_png_pixmap(&canvas),
+            OutputFormat::Jpeg => encode_rgb_jpeg_pixmap(&canvas, output_quality(scene)?),
+        }
     }
 
     pub fn clear_cache(&self) -> u64 {
@@ -180,6 +204,8 @@ impl RendererInner {
             cache_misses: cache.misses,
             cache_bytes: cache.bytes,
             cache_entries: cache.entries,
+            background_failures: self.background_failures.load(Ordering::Relaxed),
+            avatar_failures: self.avatar_failures.load(Ordering::Relaxed),
         }
     }
 
@@ -407,8 +433,34 @@ fn base_cache_key(
     );
     match (&scene.background, &scene.background_key) {
         (None, _) => Some(format!("gradient|{suffix}")),
-        (Some(_), Some(key)) => Some(format!("{key}|{suffix}")),
+        (Some(data), Some(key)) => Some(format!("{key}|{}|{suffix}", data.len())),
         (Some(_), None) => None,
+    }
+}
+
+fn strict_background_error(scene: &SceneData, error: Option<RenderError>) -> RenderError {
+    let key = scene.background_key.as_deref().unwrap_or("unnamed");
+    let detail = error.map_or_else(|| "unknown error".to_owned(), |error| error.to_string());
+    RenderError::image(format!("background {key}: {detail}"))
+}
+
+fn output_format(scene: &SceneData) -> RenderResult<OutputFormat> {
+    match scene.format.as_deref() {
+        None | Some("png") => Ok(OutputFormat::Png),
+        Some("jpeg" | "jpg") => Ok(OutputFormat::Jpeg),
+        Some(other) => Err(RenderError::invalid(format!(
+            "unsupported output format {other:?}"
+        ))),
+    }
+}
+
+fn output_quality(scene: &SceneData) -> RenderResult<u8> {
+    match scene.quality {
+        None => Ok(90),
+        Some(quality) if (1..=100).contains(&quality) => Ok(quality as u8),
+        Some(quality) => Err(RenderError::invalid(format!(
+            "quality must be in 1..=100, got {quality}"
+        ))),
     }
 }
 

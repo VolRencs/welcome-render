@@ -3,7 +3,7 @@ import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
 
-import { RenderError, WelcomeRenderer, type Scene } from "../index.js";
+import { RenderError, WelcomeRenderer, normalizeImage, probeImage, type Scene } from "../index.js";
 
 const fixtures = join(import.meta.dirname, "fixtures");
 const fontRegular = join(fixtures, "fonts/Onest-Regular.ttf");
@@ -48,6 +48,25 @@ function pngInfo(png: Buffer) {
     height: png.readUInt32BE(20),
     colorType: png[25],
   };
+}
+
+function jpegWithOrientation(data: Buffer, orientation: number): Buffer {
+  const tiff = Buffer.alloc(26);
+  tiff.write("MM", 0, "latin1");
+  tiff.writeUInt16BE(42, 2);
+  tiff.writeUInt32BE(8, 4);
+  tiff.writeUInt16BE(1, 8);
+  tiff.writeUInt16BE(0x0112, 10);
+  tiff.writeUInt16BE(3, 12);
+  tiff.writeUInt32BE(1, 14);
+  tiff.writeUInt16BE(orientation, 18);
+  tiff.writeUInt32BE(0, 22);
+  const payload = Buffer.concat([Buffer.from("Exif\0\0", "latin1"), tiff]);
+  const header = Buffer.alloc(4);
+  header[0] = 0xff;
+  header[1] = 0xe1;
+  header.writeUInt16BE(payload.length + 2, 2);
+  return Buffer.concat([data.subarray(0, 2), header, payload, data.subarray(2)]);
 }
 
 describe("WelcomeRenderer", () => {
@@ -298,6 +317,57 @@ describe("WelcomeRenderer", () => {
     });
     const png = await local.renderAsync(scene());
     assert.equal(pngInfo(png).height, 480);
+  });
+
+  test("applies EXIF orientation", async () => {
+    const jpeg = jpegWithOrientation(backgroundJpg, 6);
+    assert.deepEqual(probeImage(jpeg), {
+      width: 360,
+      height: 640,
+      format: "jpeg",
+      orientation: 6,
+    });
+    const png = await renderer.renderAsync(
+      scene({ width: undefined, height: undefined, background: jpeg, backgroundKey: "exif" }),
+    );
+    assert.deepEqual(pngInfo(png), { width: 360, height: 640, colorType: 2 });
+    const normalized = await normalizeImage(jpeg, { maxDimension: 1000, maxPixels: 1_000_000 });
+    assert.equal(normalized.width, 360);
+    assert.equal(normalized.height, 640);
+    assert.equal(normalized.format, "jpeg");
+    assert.equal(normalized.data[0], 0xff);
+    assert.equal(normalized.data[1], 0xd8);
+  });
+
+  test("encodes JPEG output", async () => {
+    const jpeg = await renderer.renderAsync(scene({ format: "jpeg", quality: 85 }));
+    assert.equal(jpeg[0], 0xff);
+    assert.equal(jpeg[1], 0xd8);
+    assert.ok(jpeg.length > 0);
+  });
+
+  test("strict background returns the decode error", async () => {
+    const local = await WelcomeRenderer.fromFiles({
+      regular: fontRegular,
+      bold: fontBold,
+      systemFonts: false,
+      cacheBytes: 16 * 1024 * 1024,
+    });
+    try {
+      await assert.rejects(
+        () => local.renderAsync(scene({ background: Buffer.from("bad"), backgroundKey: "bad", strictBackground: true })),
+        (error: unknown) => {
+          assert.ok(error instanceof RenderError);
+          assert.equal(error.code, "IMAGE_DECODE");
+          assert.match(error.message, /bad/);
+          return true;
+        },
+      );
+      assert.equal(local.stats.backgroundFailures, 1);
+      assert.equal(local.stats.cacheEntries, 0);
+    } finally {
+      local.dispose();
+    }
   });
 
   test("renders CJK and RTL text with system fallback", async () => {

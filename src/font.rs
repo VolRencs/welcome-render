@@ -34,6 +34,27 @@ fn load_faces(db: &mut Database, data: Vec<u8>, label: &str) -> RenderResult<Vec
     Ok(ids)
 }
 
+fn is_color_emoji(face: &fontdb::FaceInfo) -> bool {
+    let mut name = face.post_script_name.to_ascii_lowercase();
+    for (family, _) in &face.families {
+        name.push(' ');
+        name.push_str(&family.to_ascii_lowercase());
+    }
+    name.contains("color emoji")
+        || name.contains("color-emoji")
+        || name.contains("segoe ui emoji")
+        || name.contains("twemoji")
+        || name.contains("emojione")
+        || name.contains("joypixels")
+}
+
+fn all_system_faces(db: &Database, weight: Weight) -> Vec<ID> {
+    let mut faces: Vec<&fontdb::FaceInfo> =
+        db.faces().filter(|face| !is_color_emoji(face)).collect();
+    faces.sort_by_key(|face| (face.weight != weight, face.style != Style::Normal));
+    faces.into_iter().map(|face| face.id).collect()
+}
+
 fn query_system_families(db: &Database, weight: Weight) -> Vec<ID> {
     const FAMILIES: &[Family<'_>] = &[
         Family::SansSerif,
@@ -121,10 +142,15 @@ impl FontStore {
 
         let (system_regular, system_bold) = if system_fonts {
             db.load_system_fonts();
-            (
-                query_system_families(&db, Weight::NORMAL),
-                query_system_families(&db, Weight::BOLD),
-            )
+            let mut regular = query_system_families(&db, Weight::NORMAL);
+            for id in all_system_faces(&db, Weight::NORMAL) {
+                push_unique(&mut regular, id);
+            }
+            let mut bold = query_system_families(&db, Weight::BOLD);
+            for id in all_system_faces(&db, Weight::BOLD) {
+                push_unique(&mut bold, id);
+            }
+            (regular, bold)
         } else {
             (Vec::new(), Vec::new())
         };
