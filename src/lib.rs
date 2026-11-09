@@ -13,6 +13,7 @@ use std::sync::Arc;
 use napi::bindgen_prelude::{AsyncTask, Buffer, Env, Task};
 use napi_derive::napi;
 
+use crate::error::RenderError;
 use crate::image::ImageLimits;
 use crate::render::{RendererInner, RendererOptions};
 use crate::scene::{EllipseData, OverlayData, SceneData, TextSpecData};
@@ -35,6 +36,7 @@ pub struct NativeRendererOptions {
 impl From<NativeRendererOptions> for RendererOptions {
     fn from(value: NativeRendererOptions) -> Self {
         let defaults = Self::default();
+        let default_max_pixels = u32::try_from(defaults.limits.max_pixels).unwrap_or(u32::MAX);
         Self {
             system_fonts: value.system_fonts.unwrap_or(defaults.system_fonts),
             cache_bytes: value
@@ -45,12 +47,7 @@ impl From<NativeRendererOptions> for RendererOptions {
                     .max_dimension
                     .unwrap_or(defaults.limits.max_dimension)
                     .max(1),
-                max_pixels: u64::from(
-                    value
-                        .max_pixels
-                        .unwrap_or(defaults.limits.max_pixels as u32)
-                        .max(1),
-                ),
+                max_pixels: u64::from(value.max_pixels.unwrap_or(default_max_pixels).max(1)),
             },
         }
     }
@@ -152,12 +149,15 @@ impl NativeWelcomeRenderer {
             .map(|buffer| buffer.to_vec())
             .collect();
 
-        let inner = RendererInner::new(
-            fonts.regular.to_vec(),
-            fonts.bold.map(|buffer| buffer.to_vec()),
-            fallback,
-            options,
-        )
+        let inner = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            RendererInner::new(
+                fonts.regular.to_vec(),
+                fonts.bold.map(|buffer| buffer.to_vec()),
+                fallback,
+                options,
+            )
+        }))
+        .map_err(|_| RenderError::internal("renderer initialization panicked").into_napi())?
         .map_err(napi::Error::from)?;
 
         Ok(Self {
@@ -167,14 +167,12 @@ impl NativeWelcomeRenderer {
 
     #[napi]
     pub fn render(&self, scene: NativeScene) -> napi::Result<Buffer> {
-        let output = self
-            .inner
-            .render(&scene.into_scene())
-            .map_err(napi::Error::from)?;
+        let scene = scene.into_scene();
+        let output = guarded_render(&self.inner, &scene)?;
         Ok(Buffer::from(output))
     }
 
-    #[napi]
+    #[napi(ts_return_type = "Promise<Buffer>")]
     pub fn render_async(&self, scene: NativeScene) -> AsyncTask<RenderTask> {
         AsyncTask::new(RenderTask {
             inner: Arc::clone(&self.inner),
@@ -205,6 +203,14 @@ impl NativeWelcomeRenderer {
     }
 }
 
+fn guarded_render(inner: &RendererInner, scene: &SceneData) -> napi::Result<Vec<u8>> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| inner.render(scene))) {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(error)) => Err(error.into_napi()),
+        Err(_) => Err(RenderError::internal("render panicked").into_napi()),
+    }
+}
+
 pub struct RenderTask {
     inner: Arc<RendererInner>,
     scene: SceneData,
@@ -216,7 +222,7 @@ impl Task for RenderTask {
     type JsValue = Buffer;
 
     fn compute(&mut self) -> napi::Result<Self::Output> {
-        self.inner.render(&self.scene).map_err(napi::Error::from)
+        guarded_render(&self.inner, &self.scene)
     }
 
     fn resolve(&mut self, _env: Env, output: Self::Output) -> napi::Result<Self::JsValue> {

@@ -10,6 +10,14 @@ function normalizeScene(scene) {
   for (const key of ["background", "avatar", "overlay", "avatarEllipse", "backgroundKey"]) {
     if (normalized[key] == null) delete normalized[key];
   }
+  if (Array.isArray(normalized.texts)) {
+    normalized.texts = normalized.texts.map((text) => {
+      if (!text || text.weight != null) return text;
+      const copy = { ...text };
+      delete copy.weight;
+      return copy;
+    });
+  }
   return normalized;
 }
 

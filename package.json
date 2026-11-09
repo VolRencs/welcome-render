@@ -1,8 +1,24 @@
 {
   "name": "welcome-render",
   "version": "0.1.0",
+  "private": true,
   "description": "Native scene compositor for GOPlay welcome images",
   "license": "GPL-3.0-only",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/VolRencs/welcome-render.git"
+  },
+  "bugs": {
+    "url": "https://github.com/VolRencs/welcome-render/issues"
+  },
+  "homepage": "https://github.com/VolRencs/welcome-render#readme",
+  "keywords": [
+    "welcome",
+    "discord",
+    "renderer",
+    "napi",
+    "rust"
+  ],
   "type": "module",
   "main": "./index.js",
   "types": "./index.d.ts",

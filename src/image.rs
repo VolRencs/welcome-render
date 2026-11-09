@@ -51,12 +51,11 @@ pub struct DecodedImage {
 }
 
 impl DecodedImage {
-    pub fn to_pixmap(&self) -> RenderResult<Pixmap> {
+    pub fn into_pixmap(mut self) -> RenderResult<Pixmap> {
         let size = IntSize::from_wh(self.width, self.height)
             .ok_or_else(|| RenderError::internal("invalid decoded image size"))?;
-        let mut rgba = self.rgba.clone();
-        premultiply(&mut rgba);
-        Pixmap::from_vec(rgba, size)
+        premultiply(&mut self.rgba);
+        Pixmap::from_vec(self.rgba, size)
             .ok_or_else(|| RenderError::internal("failed to create pixmap from decoded image"))
     }
 }

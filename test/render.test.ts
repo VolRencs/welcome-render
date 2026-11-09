@@ -146,6 +146,50 @@ describe("WelcomeRenderer", () => {
     }
   });
 
+  test("does not cache the fallback gradient after a decode failure", async () => {
+    const local = await WelcomeRenderer.fromFiles({
+      regular: fontRegular,
+      bold: fontBold,
+      systemFonts: false,
+      cacheBytes: 16 * 1024 * 1024,
+    });
+    try {
+      const broken = Buffer.from("not an image");
+      const gradient = await local.renderAsync(
+        scene({ background: broken, backgroundKey: "broken-bg" }),
+      );
+      assert.equal(local.stats.cacheEntries, 0);
+      await local.renderAsync(scene({ background: broken, backgroundKey: "broken-bg" }));
+      assert.equal(local.stats.cacheEntries, 0);
+
+      const valid = await local.renderAsync(
+        scene({ background: backgroundPng, backgroundKey: "broken-bg" }),
+      );
+      assert.equal(local.stats.cacheEntries, 1);
+      assert.equal(gradient.equals(valid), false);
+    } finally {
+      local.dispose();
+    }
+  });
+
+  test("treats null optional text fields as defaults", async () => {
+    const png = await renderer.renderAsync(
+      scene({
+        texts: [
+          {
+            text: "x",
+            x: 10,
+            y: 10,
+            size: 12,
+            color: "#fff",
+            weight: null as unknown as number,
+          },
+        ],
+      }),
+    );
+    assert.equal(pngInfo(png).width, 900);
+  });
+
   test("rejects invalid colors with a code", async () => {
     await assert.rejects(
       () =>

@@ -1,5 +1,5 @@
 use std::collections::{HashMap, VecDeque};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use tiny_skia::Pixmap;
 
@@ -12,7 +12,7 @@ pub struct CacheStats {
 }
 
 struct Entry {
-    pixmap: std::sync::Arc<Pixmap>,
+    pixmap: Arc<Pixmap>,
     bytes: usize,
 }
 
@@ -71,13 +71,13 @@ impl PixmapCache {
     }
 
     #[must_use]
-    pub fn get(&self, key: &str) -> Option<std::sync::Arc<Pixmap>> {
+    pub fn get(&self, key: &str) -> Option<Arc<Pixmap>> {
         let mut inner = self
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(entry) = inner.entries.get(key) {
-            let pixmap = std::sync::Arc::clone(&entry.pixmap);
+            let pixmap = Arc::clone(&entry.pixmap);
             inner.hits += 1;
             inner.touch(key);
             return Some(pixmap);
@@ -86,7 +86,12 @@ impl PixmapCache {
         None
     }
 
+    #[cfg(test)]
     pub fn insert(&self, key: String, pixmap: Pixmap) {
+        self.insert_arc(key, Arc::new(pixmap));
+    }
+
+    pub fn insert_arc(&self, key: String, pixmap: Arc<Pixmap>) {
         if self.max_bytes == 0 {
             return;
         }
@@ -101,13 +106,7 @@ impl PixmapCache {
         inner.remove(&key);
         inner.bytes += bytes;
         inner.order.push_back(key.clone());
-        inner.entries.insert(
-            key,
-            Entry {
-                pixmap: std::sync::Arc::new(pixmap),
-                bytes,
-            },
-        );
+        inner.entries.insert(key, Entry { pixmap, bytes });
         inner.evict(self.max_bytes);
     }
 

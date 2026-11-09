@@ -42,12 +42,6 @@ pub struct TextEngine {
     cache: Mutex<HashMap<TextKey, Arc<TextLayout>>>,
 }
 
-impl Default for TextEngine {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl TextEngine {
     #[must_use]
     pub fn new() -> Self {
@@ -76,30 +70,52 @@ impl TextEngine {
 
         let mut builder =
             PathBuilder::with_capacity(layout.glyphs.len() * 4, layout.glyphs.len() * 8);
+        let glyphs = &layout.glyphs;
         let mut pen_x = spec.x - layout.width / 2.0;
+        let mut index = 0;
 
-        for glyph in &layout.glyphs {
-            let face_id = fonts.face_id(glyph.face, spec.bold);
-            let scale = glyph.scale;
-            let tx = pen_x + glyph.x_offset;
-            let ty = spec.y - glyph.y_offset;
+        // Parse each font face once per contiguous run instead of once per glyph.
+        while index < glyphs.len() {
+            let face = glyphs[index].face;
+            let start = index;
+            while index < glyphs.len() && glyphs[index].face == face {
+                index += 1;
+            }
 
-            fonts
+            let face_id = fonts.face_id(face, spec.bold);
+            let end_pen = fonts
                 .database()
                 .with_face_data(face_id, |data, face_index| {
-                    if let Ok(face) = ttf_parser::Face::parse(data, face_index) {
-                        let mut outline = OutlineToPath {
-                            builder: &mut builder,
-                            scale,
-                            tx,
-                            ty,
-                        };
-                        let _ =
-                            face.outline_glyph(ttf_parser::GlyphId(glyph.glyph_id), &mut outline);
+                    let mut pen = pen_x;
+                    if let Ok(parsed) = ttf_parser::Face::parse(data, face_index) {
+                        for glyph in &glyphs[start..index] {
+                            let tx = pen + glyph.x_offset;
+                            let ty = spec.y - glyph.y_offset;
+                            let mut outline = OutlineToPath {
+                                builder: &mut builder,
+                                scale: glyph.scale,
+                                tx,
+                                ty,
+                            };
+                            let _ = parsed
+                                .outline_glyph(ttf_parser::GlyphId(glyph.glyph_id), &mut outline);
+                            pen += glyph.x_advance;
+                        }
+                    } else {
+                        for glyph in &glyphs[start..index] {
+                            pen += glyph.x_advance;
+                        }
                     }
+                    pen
                 });
 
-            pen_x += glyph.x_advance;
+            pen_x = end_pen.unwrap_or_else(|| {
+                pen_x
+                    + glyphs[start..index]
+                        .iter()
+                        .map(|glyph| glyph.x_advance)
+                        .sum::<f32>()
+            });
         }
 
         let Some(path) = builder.finish() else {
@@ -315,12 +331,24 @@ impl TextEngine {
 
 fn normalize_text(text: &str) -> String {
     let mut output = String::with_capacity(text.len());
-    for word in text.split_whitespace() {
-        if !output.is_empty() {
-            output.push(' ');
+    let mut pending_space = false;
+
+    // SVG's default white-space handling collapses ASCII whitespace but keeps
+    // non-breaking and other Unicode spaces intact.
+    for ch in text.chars() {
+        if matches!(ch, ' ' | '\t' | '\n' | '\r') {
+            if !output.is_empty() {
+                pending_space = true;
+            }
+        } else {
+            if pending_space {
+                output.push(' ');
+                pending_space = false;
+            }
+            output.push(ch);
         }
-        output.push_str(word);
     }
+
     output
 }
 
@@ -374,6 +402,7 @@ mod tests {
     #[test]
     fn normalizes_whitespace() {
         assert_eq!(normalize_text("  hello\n\tworld  "), "hello world");
+        assert_eq!(normalize_text("a\u{a0}b"), "a\u{a0}b");
         assert_eq!(normalize_text(""), "");
     }
 }

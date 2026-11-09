@@ -83,26 +83,30 @@ impl RendererInner {
         // When the caller knows the canvas size, a warm cache hit must not decode
         // the background at all. Without explicit dimensions we have to decode it
         // to discover the size.
-        let (width, height, mut background) = match (scene.width, scene.height) {
-            (Some(width), Some(height)) => (width, height, None),
-            (None, None) => {
-                let decoded = scene
-                    .background
-                    .as_deref()
-                    .and_then(|data| decode_image(data, self.limits).ok());
-                let dimensions = decoded
-                    .as_ref()
-                    .map_or((DESIGN_WIDTH, DESIGN_HEIGHT), |background| {
-                        (background.width, background.height)
-                    });
-                (dimensions.0, dimensions.1, decoded)
-            }
-            _ => {
-                return Err(RenderError::invalid(
-                    "width and height must be provided together",
-                ));
-            }
-        };
+        let (width, height, mut background, mut background_failed) =
+            match (scene.width, scene.height) {
+                (Some(width), Some(height)) => (width, height, None, false),
+                (None, None) => {
+                    let (decoded, failed) = match scene.background.as_deref() {
+                        Some(data) => match decode_image(data, self.limits) {
+                            Ok(background) => (Some(background), false),
+                            Err(_) => (None, true),
+                        },
+                        None => (None, false),
+                    };
+                    let dimensions = decoded
+                        .as_ref()
+                        .map_or((DESIGN_WIDTH, DESIGN_HEIGHT), |background| {
+                            (background.width, background.height)
+                        });
+                    (dimensions.0, dimensions.1, decoded, failed)
+                }
+                _ => {
+                    return Err(RenderError::invalid(
+                        "width and height must be provided together",
+                    ));
+                }
+            };
 
         if width == 0 || height == 0 {
             return Err(RenderError::invalid("canvas dimensions must be positive"));
@@ -122,23 +126,28 @@ impl RendererInner {
         let base = match cached {
             Some(pixmap) => pixmap,
             None => {
-                if background.is_none() {
-                    background = scene
-                        .background
-                        .as_deref()
-                        .and_then(|data| decode_image(data, self.limits).ok());
+                if background.is_none()
+                    && !background_failed
+                    && let Some(data) = scene.background.as_deref()
+                {
+                    match decode_image(data, self.limits) {
+                        Ok(decoded) => background = Some(decoded),
+                        Err(_) => background_failed = true,
+                    }
                 }
-                let built = self.build_base(
+                let built = Arc::new(self.build_base(
                     width,
                     height,
-                    background.as_ref(),
+                    background,
                     overlay_color,
                     overlay_opacity,
-                )?;
-                if let Some(key) = cache_key {
-                    self.cache.insert(key, built.clone());
+                )?);
+                if let Some(key) = cache_key
+                    && !background_failed
+                {
+                    self.cache.insert_arc(key, Arc::clone(&built));
                 }
-                Arc::new(built)
+                built
             }
         };
 
@@ -178,7 +187,7 @@ impl RendererInner {
         &self,
         width: u32,
         height: u32,
-        background: Option<&DecodedImage>,
+        background: Option<DecodedImage>,
         overlay_color: ColorU8,
         overlay_opacity: f32,
     ) -> RenderResult<Pixmap> {
@@ -187,21 +196,23 @@ impl RendererInner {
 
         match background {
             Some(background) if background.width == width && background.height == height => {
-                composite_background_exact(&mut canvas, background);
+                composite_background_exact(&mut canvas, &background);
             }
             Some(background) => {
+                let background_width = background.width;
+                let background_height = background.height;
                 canvas.fill(Color::from_rgba8(
                     ColorU8::BASE.r,
                     ColorU8::BASE.g,
                     ColorU8::BASE.b,
                     255,
                 ));
-                let source = background.to_pixmap()?;
-                let scale_x = width as f32 / background.width as f32;
-                let scale_y = height as f32 / background.height as f32;
+                let source = background.into_pixmap()?;
+                let scale_x = width as f32 / background_width as f32;
+                let scale_y = height as f32 / background_height as f32;
                 let scale = scale_x.max(scale_y);
-                let draw_width = background.width as f32 * scale;
-                let draw_height = background.height as f32 * scale;
+                let draw_width = background_width as f32 * scale;
+                let draw_height = background_height as f32 * scale;
                 let dx = (width as f32 - draw_width) / 2.0;
                 let dy = (height as f32 - draw_height) / 2.0;
 
@@ -243,6 +254,18 @@ impl RendererInner {
             ));
         }
 
+        let left = ellipse.cx - ellipse.rx;
+        let top = ellipse.cy - ellipse.ry;
+        let right = ellipse.cx + ellipse.rx;
+        let bottom = ellipse.cy + ellipse.ry;
+        if right <= 0.0
+            || bottom <= 0.0
+            || left >= canvas.width() as f32
+            || top >= canvas.height() as f32
+        {
+            return Ok(());
+        }
+
         let target_width = (ellipse.rx * 2.0).ceil();
         let target_height = (ellipse.ry * 2.0).ceil();
         if !target_width.is_finite()
@@ -266,15 +289,17 @@ impl RendererInner {
         }
 
         let image = decode_image(data, self.limits)?;
-        let source = image.to_pixmap()?;
+        let image_width = image.width;
+        let image_height = image.height;
+        let source = image.into_pixmap()?;
         let mut avatar = Pixmap::new(target_width, target_height)
             .ok_or_else(|| RenderError::internal("failed to allocate avatar canvas"))?;
 
         let target_w = target_width as f32;
         let target_h = target_height as f32;
-        let scale = (target_w / image.width as f32).max(target_h / image.height as f32);
-        let draw_width = image.width as f32 * scale;
-        let draw_height = image.height as f32 * scale;
+        let scale = (target_w / image_width as f32).max(target_h / image_height as f32);
+        let draw_width = image_width as f32 * scale;
+        let draw_height = image_height as f32 * scale;
         let dx = (target_w - draw_width) / 2.0;
         let dy = (target_h - draw_height) / 2.0;
 
@@ -320,6 +345,9 @@ impl RendererInner {
 }
 
 fn fit_to_limits(width: u32, height: u32, max_dimension: u32, max_pixels: u64) -> (u32, u32) {
+    if width == 0 || height == 0 {
+        return (1, 1);
+    }
     let max_dimension = u64::from(max_dimension.max(1));
     let max_pixels = max_pixels.max(1);
     let pixels = u64::from(width) * u64::from(height);
@@ -393,6 +421,14 @@ fn composite_background_exact(canvas: &mut Pixmap, background: &DecodedImage) {
         .zip(data.chunks_exact_mut(4))
     {
         let alpha = u32::from(source[3]);
+        if alpha == 255 {
+            target.copy_from_slice(source);
+            continue;
+        }
+        if alpha == 0 {
+            target.copy_from_slice(&[base.r, base.g, base.b, 255]);
+            continue;
+        }
         let inverse = 255 - alpha;
         target[0] =
             ((u32::from(source[0]) * alpha + u32::from(base.r) * inverse + 127) / 255) as u8;
@@ -431,11 +467,22 @@ fn fill_gradient(canvas: &mut Pixmap) {
 }
 
 fn apply_overlay(canvas: &mut Pixmap, color: ColorU8, opacity: f32) {
-    let alpha = (opacity * f32::from(color.a) / 255.0 * 255.0).round() as u32;
+    let alpha = (opacity * f32::from(color.a)).round() as u32;
     if alpha == 0 {
         return;
     }
     let inverse = 255 - alpha;
+
+    if color.r == 0 && color.g == 0 && color.b == 0 {
+        for pixel in canvas.data_mut().chunks_exact_mut(4) {
+            pixel[0] = ((u32::from(pixel[0]) * inverse + 127) / 255) as u8;
+            pixel[1] = ((u32::from(pixel[1]) * inverse + 127) / 255) as u8;
+            pixel[2] = ((u32::from(pixel[2]) * inverse + 127) / 255) as u8;
+            pixel[3] = 255;
+        }
+        return;
+    }
+
     for pixel in canvas.data_mut().chunks_exact_mut(4) {
         pixel[0] = ((u32::from(pixel[0]) * inverse + u32::from(color.r) * alpha + 127) / 255) as u8;
         pixel[1] = ((u32::from(pixel[1]) * inverse + u32::from(color.g) * alpha + 127) / 255) as u8;
@@ -455,6 +502,7 @@ mod tests {
     #[test]
     fn keeps_canvas_that_fits() {
         assert_eq!(fit_to_limits(900, 480, 4096, 16_777_216), (900, 480));
+        assert_eq!(fit_to_limits(0, 10, 4096, 16_777_216), (1, 1));
     }
 
     #[test]

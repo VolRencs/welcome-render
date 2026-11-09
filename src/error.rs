@@ -48,16 +48,6 @@ impl RenderError {
     }
 
     #[must_use]
-    pub fn code(&self) -> &'static str {
-        self.code
-    }
-
-    #[must_use]
-    pub fn message(&self) -> &str {
-        &self.message
-    }
-
-    #[must_use]
     pub fn into_napi(self) -> napi::Error {
         let status = match self.code {
             "INVALID_ARGUMENT" | "IMAGE_TOO_LARGE" => napi::Status::InvalidArg,

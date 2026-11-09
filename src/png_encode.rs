@@ -13,6 +13,7 @@ pub fn encode_rgb_png(pixmap: &Pixmap) -> RenderResult<Vec<u8>> {
 
     let mut rgb = Vec::with_capacity(width as usize * height as usize * 3);
     for pixel in data.chunks_exact(4) {
+        debug_assert_eq!(pixel[3], 255, "renderer canvas must stay opaque");
         rgb.extend_from_slice(&pixel[0..3]);
     }
 
