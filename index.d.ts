@@ -25,6 +25,17 @@ export interface FromFilesOptions extends RendererOptions {
 
 export type ImageFormat = "png" | "jpeg" | "webp";
 
+export type ErrorCode =
+  | "NATIVE_LOAD"
+  | "INVALID_ARGUMENT"
+  | "FONT_READ"
+  | "FONT_PARSE"
+  | "IMAGE_DECODE"
+  | "IMAGE_TOO_LARGE"
+  | "PNG_ENCODE"
+  | "JPEG_ENCODE"
+  | "INTERNAL";
+
 export interface ImageInfo {
   width: number;
   height: number;
@@ -109,8 +120,13 @@ export function normalizeImage(
 ): Promise<NormalizedImage>;
 
 export class RenderError extends Error {
-  readonly code: string;
-  constructor(code: string, message: string, options?: ErrorOptions);
+  override readonly name: "RenderError";
+  readonly code: ErrorCode | (string & {});
+  constructor(
+    code: ErrorCode | (string & {}),
+    message: string,
+    options?: ErrorOptions,
+  );
 }
 
 export class WelcomeRenderer {
@@ -128,6 +144,7 @@ export class WelcomeRenderer {
 
   dispose(): void;
   [Symbol.dispose](): void;
+  [Symbol.asyncDispose](): Promise<void>;
 }
 
 export default WelcomeRenderer;

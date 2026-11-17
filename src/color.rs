@@ -34,47 +34,46 @@ impl ColorU8 {
         let hex = value.strip_prefix('#').ok_or_else(|| {
             RenderError::invalid(format!("color must start with '#', got {value:?}"))
         })?;
+        let bytes = hex.as_bytes();
 
-        let component = |text: &str| -> RenderResult<u8> {
-            u8::from_str_radix(text, 16)
-                .map_err(|_| RenderError::invalid(format!("invalid color component {text:?}")))
+        let nibble = |byte: u8| -> RenderResult<u8> {
+            match byte {
+                b'0'..=b'9' => Ok(byte - b'0'),
+                b'a'..=b'f' => Ok(byte - b'a' + 10),
+                b'A'..=b'F' => Ok(byte - b'A' + 10),
+                _ => Err(RenderError::invalid(format!(
+                    "invalid color component byte 0x{byte:02x}"
+                ))),
+            }
+        };
+        let component = |index: usize| -> RenderResult<u8> {
+            Ok(nibble(bytes[index])? * 16 + nibble(bytes[index + 1])?)
         };
 
-        match hex.len() {
-            3 => {
-                let r = component(&hex[0..1])?;
-                let g = component(&hex[1..2])?;
-                let b = component(&hex[2..3])?;
-                Ok(Self {
-                    r: r * 17,
-                    g: g * 17,
-                    b: b * 17,
-                    a: 255,
-                })
-            }
-            4 => {
-                let r = component(&hex[0..1])?;
-                let g = component(&hex[1..2])?;
-                let b = component(&hex[2..3])?;
-                let a = component(&hex[3..4])?;
-                Ok(Self {
-                    r: r * 17,
-                    g: g * 17,
-                    b: b * 17,
-                    a: a * 17,
-                })
-            }
+        match bytes.len() {
+            3 => Ok(Self {
+                r: nibble(bytes[0])? * 17,
+                g: nibble(bytes[1])? * 17,
+                b: nibble(bytes[2])? * 17,
+                a: 255,
+            }),
+            4 => Ok(Self {
+                r: nibble(bytes[0])? * 17,
+                g: nibble(bytes[1])? * 17,
+                b: nibble(bytes[2])? * 17,
+                a: nibble(bytes[3])? * 17,
+            }),
             6 => Ok(Self {
-                r: component(&hex[0..2])?,
-                g: component(&hex[2..4])?,
-                b: component(&hex[4..6])?,
+                r: component(0)?,
+                g: component(2)?,
+                b: component(4)?,
                 a: 255,
             }),
             8 => Ok(Self {
-                r: component(&hex[0..2])?,
-                g: component(&hex[2..4])?,
-                b: component(&hex[4..6])?,
-                a: component(&hex[6..8])?,
+                r: component(0)?,
+                g: component(2)?,
+                b: component(4)?,
+                a: component(6)?,
             }),
             _ => Err(RenderError::invalid(format!(
                 "unsupported color format {value:?}"
@@ -119,5 +118,20 @@ mod tests {
         assert!(ColorU8::parse("fff").is_err());
         assert!(ColorU8::parse("#12").is_err());
         assert!(ColorU8::parse("#gggggg").is_err());
+        assert!(ColorU8::parse("#éa").is_err());
+        assert!(ColorU8::parse("#aé").is_err());
+    }
+
+    #[test]
+    fn accepts_uppercase_hex() {
+        assert_eq!(
+            ColorU8::parse("#AbCdEf").unwrap(),
+            ColorU8 {
+                r: 0xab,
+                g: 0xcd,
+                b: 0xef,
+                a: 255,
+            }
+        );
     }
 }

@@ -113,8 +113,8 @@ pub struct FontStore {
     db: Database,
     regular_chain: Vec<ID>,
     bold_chain: Vec<ID>,
-    /// char code -> index in the selected chain
-    char_cache: Mutex<HashMap<(u32, bool), usize>>,
+    /// char -> index in the selected chain
+    char_cache: Mutex<HashMap<(char, bool), usize>>,
 }
 
 impl FontStore {
@@ -207,7 +207,9 @@ impl FontStore {
     }
 
     pub fn face_id(&self, chain_index: usize, bold: bool) -> ID {
-        self.chain(bold)[chain_index]
+        let chain = self.chain(bold);
+        debug_assert!(chain_index < chain.len(), "font chain index out of bounds");
+        chain[chain_index]
     }
 
     pub fn face_for_char(&self, ch: char, bold: bool) -> usize {
@@ -216,7 +218,7 @@ impl FontStore {
                 .char_cache
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if let Some(index) = cache.get(&(ch as u32, bold)) {
+            if let Some(index) = cache.get(&(ch, bold)) {
                 return *index;
             }
         }
@@ -243,7 +245,7 @@ impl FontStore {
             .char_cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        cache.insert((ch as u32, bold), found);
+        cache.insert((ch, bold), found);
         found
     }
 }

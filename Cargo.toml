@@ -1,8 +1,8 @@
 [package]
 name = "welcome-render"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
-rust-version = "1.99"
+rust-version = "1.100"
 license = "GPL-3.0-only"
 description = "Native scene compositor for GOPlay welcome images"
 repository = "https://github.com/VolRencs/welcome-render"
@@ -15,8 +15,8 @@ crate-type = ["cdylib"]
 fontdb = "0.24.0"
 image-webp = "0.2.4"
 jpeg-encoder = "0.7.1"
-napi = { version = "3.16.1", features = ["napi10"] }
-napi-derive = "3.7.0"
+napi = { version = "3.16.2", features = ["napi10"] }
+napi-derive = "3.7.1"
 png = "0.18.1"
 rustybuzz = "0.20.1"
 tiny-skia = { version = "0.12.0", default-features = false, features = ["std", "simd"] }
@@ -44,4 +44,3 @@ all = { level = "warn", priority = -1 }
 correctness = { level = "deny", priority = -1 }
 perf = { level = "warn", priority = -1 }
 suspicious = { level = "warn", priority = -1 }
-chunks_exact_to_as_chunks = "allow"

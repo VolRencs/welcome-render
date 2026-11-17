@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
 use rustybuzz::{Direction, UnicodeBuffer, shape};
@@ -150,8 +151,8 @@ impl TextEngine {
             )));
         }
 
-        let normalized = normalize_text(text);
-        if normalized.chars().count() > MAX_TEXT_CHARS {
+        let (normalized, char_count) = normalize_text(text);
+        if char_count > MAX_TEXT_CHARS {
             return Err(RenderError::invalid(format!(
                 "text is longer than {MAX_TEXT_CHARS} characters"
             )));
@@ -198,7 +199,7 @@ impl TextEngine {
             return Ok(TextLayout::default());
         }
 
-        let mut glyphs = Vec::new();
+        let mut glyphs = Vec::with_capacity(text.len());
         // SVG text has an LTR base direction unless `direction` is set. Matching
         // that keeps mixed RTL/LTR lines consistent with the browser preview.
         let bidi = BidiInfo::new(text, Some(unicode_bidi::Level::ltr()));
@@ -246,45 +247,47 @@ impl TextEngine {
             return Ok(());
         }
 
-        let mut segments: Vec<(usize, String)> = Vec::new();
-        for ch in text.chars() {
+        let mut segments: Vec<(usize, Range<usize>)> = Vec::new();
+        let mut current: Option<(usize, usize)> = None;
+        for (offset, ch) in text.char_indices() {
             let face = fonts.face_for_char(ch, bold);
-            if let Some((current_face, buffer)) = segments.last_mut()
-                && *current_face == face
-            {
-                buffer.push(ch);
-                continue;
+            match current {
+                Some((current_face, _)) if current_face == face => {}
+                Some((current_face, start)) => {
+                    segments.push((current_face, start..offset));
+                    current = Some((face, offset));
+                }
+                None => current = Some((face, offset)),
             }
-            let mut buffer = String::new();
-            buffer.push(ch);
-            segments.push((face, buffer));
+        }
+        if let Some((face, start)) = current {
+            segments.push((face, start..text.len()));
         }
 
         if rtl {
             segments.reverse();
         }
 
-        for (face, segment) in segments {
-            let glyphs = self.shape_segment(fonts, &segment, face, size, bold, rtl)?;
-            output.extend(glyphs);
+        for (face, range) in segments {
+            Self::shape_segment(fonts, &text[range], face, size, bold, rtl, output)?;
         }
 
         Ok(())
     }
 
     fn shape_segment(
-        &self,
         fonts: &FontStore,
         text: &str,
         face_index: usize,
         size: f32,
         bold: bool,
         rtl: bool,
-    ) -> RenderResult<Vec<ShapedGlyph>> {
+        output: &mut Vec<ShapedGlyph>,
+    ) -> RenderResult<()> {
         let face_id = fonts.face_id(face_index, bold);
-        let result = fonts
+        fonts
             .database()
-            .with_face_data(face_id, |data, index| -> RenderResult<Vec<ShapedGlyph>> {
+            .with_face_data(face_id, |data, index| -> RenderResult<()> {
                 let face = rustybuzz::Face::from_slice(data, index)
                     .ok_or_else(|| RenderError::font("failed to parse shaped font face"))?;
                 let units_per_em = face.units_per_em();
@@ -305,13 +308,13 @@ impl TextEngine {
                 let shaped = shape(&face, &[], buffer);
                 let infos = shaped.glyph_infos();
                 let positions = shaped.glyph_positions();
-                let mut glyphs = Vec::with_capacity(infos.len());
+                output.reserve(infos.len());
 
                 for (info, position) in infos.iter().zip(positions) {
                     let glyph_id = u16::try_from(info.glyph_id).map_err(|_| {
                         RenderError::font("font produced a glyph id larger than u16")
                     })?;
-                    glyphs.push(ShapedGlyph {
+                    output.push(ShapedGlyph {
                         face: face_index,
                         glyph_id,
                         scale,
@@ -321,17 +324,18 @@ impl TextEngine {
                     });
                 }
 
-                Ok(glyphs)
+                Ok(())
             })
             .ok_or_else(|| RenderError::font("failed to load shaped font face"))??;
 
-        Ok(result)
+        Ok(())
     }
 }
 
-fn normalize_text(text: &str) -> String {
+fn normalize_text(text: &str) -> (String, usize) {
     let mut output = String::with_capacity(text.len());
     let mut pending_space = false;
+    let mut char_count = 0;
 
     // SVG's default white-space handling collapses ASCII whitespace but keeps
     // non-breaking and other Unicode spaces intact.
@@ -343,13 +347,15 @@ fn normalize_text(text: &str) -> String {
         } else {
             if pending_space {
                 output.push(' ');
+                char_count += 1;
                 pending_space = false;
             }
             output.push(ch);
+            char_count += 1;
         }
     }
 
-    output
+    (output, char_count)
 }
 
 struct OutlineToPath<'a> {
@@ -401,8 +407,11 @@ mod tests {
 
     #[test]
     fn normalizes_whitespace() {
-        assert_eq!(normalize_text("  hello\n\tworld  "), "hello world");
-        assert_eq!(normalize_text("a\u{a0}b"), "a\u{a0}b");
-        assert_eq!(normalize_text(""), "");
+        assert_eq!(
+            normalize_text("  hello\n\tworld  "),
+            ("hello world".to_owned(), 11)
+        );
+        assert_eq!(normalize_text("a\u{a0}b"), ("a\u{a0}b".to_owned(), 3));
+        assert_eq!(normalize_text(""), (String::new(), 0));
     }
 }

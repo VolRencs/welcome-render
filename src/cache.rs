@@ -14,36 +14,59 @@ pub struct CacheStats {
 struct Entry {
     pixmap: Arc<Pixmap>,
     bytes: usize,
+    stamp: u64,
 }
 
 struct Inner {
     entries: HashMap<String, Entry>,
-    order: VecDeque<String>,
+    order: VecDeque<(u64, String)>,
     bytes: usize,
     hits: u64,
     misses: u64,
+    clock: u64,
 }
 
 impl Inner {
+    fn next_stamp(&mut self) -> u64 {
+        self.clock = self.clock.wrapping_add(1);
+        self.clock
+    }
+
     fn touch(&mut self, key: &str) {
-        self.order.retain(|existing| existing != key);
-        self.order.push_back(key.to_owned());
+        let stamp = self.next_stamp();
+        if let Some(entry) = self.entries.get_mut(key) {
+            entry.stamp = stamp;
+            self.order.push_back((stamp, key.to_owned()));
+        }
+        self.prune_order();
     }
 
     fn remove(&mut self, key: &str) {
-        let Some(entry) = self.entries.remove(key) else {
+        if let Some(entry) = self.entries.remove(key) {
+            self.bytes = self.bytes.saturating_sub(entry.bytes);
+        }
+    }
+
+    fn prune_order(&mut self) {
+        let limit = self.entries.len().saturating_mul(2).max(8);
+        if self.order.len() <= limit {
             return;
-        };
-        self.bytes = self.bytes.saturating_sub(entry.bytes);
-        self.order.retain(|existing| existing != key);
+        }
+        let entries = &self.entries;
+        self.order
+            .retain(|(stamp, key)| entries.get(key).is_some_and(|entry| entry.stamp == *stamp));
     }
 
     fn evict(&mut self, max_bytes: usize) {
         while self.bytes > max_bytes {
-            let Some(oldest) = self.order.pop_front() else {
+            let Some((stamp, key)) = self.order.pop_front() else {
                 break;
             };
-            if let Some(entry) = self.entries.remove(&oldest) {
+            let is_current = self
+                .entries
+                .get(&key)
+                .is_some_and(|entry| entry.stamp == stamp);
+            if is_current && let Some(entry) = self.entries.remove(&key) {
                 self.bytes = self.bytes.saturating_sub(entry.bytes);
             }
         }
@@ -65,6 +88,7 @@ impl PixmapCache {
                 bytes: 0,
                 hits: 0,
                 misses: 0,
+                clock: 0,
             }),
             max_bytes,
         }
@@ -76,8 +100,11 @@ impl PixmapCache {
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(entry) = inner.entries.get(key) {
-            let pixmap = Arc::clone(&entry.pixmap);
+        let pixmap = inner
+            .entries
+            .get(key)
+            .map(|entry| Arc::clone(&entry.pixmap));
+        if let Some(pixmap) = pixmap {
             inner.hits += 1;
             inner.touch(key);
             return Some(pixmap);
@@ -105,8 +132,17 @@ impl PixmapCache {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         inner.remove(&key);
         inner.bytes += bytes;
-        inner.order.push_back(key.clone());
-        inner.entries.insert(key, Entry { pixmap, bytes });
+        let stamp = inner.next_stamp();
+        inner.order.push_back((stamp, key.clone()));
+        inner.entries.insert(
+            key,
+            Entry {
+                pixmap,
+                bytes,
+                stamp,
+            },
+        );
+        inner.prune_order();
         inner.evict(self.max_bytes);
     }
 
@@ -119,6 +155,7 @@ impl PixmapCache {
         inner.entries.clear();
         inner.order.clear();
         inner.bytes = 0;
+        inner.clock = 0;
         bytes
     }
 
@@ -164,6 +201,35 @@ mod tests {
     #[test]
     fn ignores_oversized_pixmaps() {
         let cache = PixmapCache::new(16);
+        cache.insert("a".into(), pixmap());
+        assert!(cache.get("a").is_none());
+    }
+
+    #[test]
+    fn keeps_recently_used_entries() {
+        let cache = PixmapCache::new(128);
+        cache.insert("a".into(), pixmap());
+        cache.insert("b".into(), pixmap());
+        assert!(cache.get("a").is_some());
+        cache.insert("c".into(), pixmap());
+        assert!(cache.get("a").is_some());
+        assert!(cache.get("b").is_none());
+        assert!(cache.get("c").is_some());
+    }
+
+    #[test]
+    fn replaces_existing_entries_without_double_counting() {
+        let cache = PixmapCache::new(128);
+        cache.insert("a".into(), pixmap());
+        cache.insert("a".into(), pixmap());
+        let stats = cache.stats();
+        assert_eq!(stats.entries, 1);
+        assert_eq!(stats.bytes, 64);
+    }
+
+    #[test]
+    fn zero_budget_disables_storage() {
+        let cache = PixmapCache::new(0);
         cache.insert("a".into(), pixmap());
         assert!(cache.get("a").is_none());
     }

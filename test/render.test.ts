@@ -3,7 +3,14 @@ import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
 
-import { RenderError, WelcomeRenderer, normalizeImage, probeImage, type Scene } from "../index.js";
+import {
+  RenderError,
+  WelcomeRenderer,
+  normalizeImage,
+  probeImage,
+  type NormalizeImageOptions,
+  type Scene,
+} from "../index.js";
 
 const fixtures = join(import.meta.dirname, "fixtures");
 const fontRegular = join(fixtures, "fonts/Onest-Regular.ttf");
@@ -210,10 +217,71 @@ describe("WelcomeRenderer", () => {
   });
 
   test("rejects invalid colors with a code", async () => {
+    for (const color of ["red", "#éa"]) {
+      await assert.rejects(
+        () =>
+          renderer.renderAsync(
+            scene({ texts: [{ text: "x", x: 10, y: 10, size: 12, color }] }),
+          ),
+        (error: unknown) => {
+          assert.ok(error instanceof RenderError);
+          assert.equal(error.code, "INVALID_ARGUMENT");
+          return true;
+        },
+      );
+    }
+  });
+
+  test("validates scenes before calling native", async () => {
     await assert.rejects(
+      () => renderer.renderAsync({} as Scene),
+      (error: unknown) => {
+        assert.ok(error instanceof RenderError);
+        assert.equal(error.code, "INVALID_ARGUMENT");
+        return true;
+      },
+    );
+  });
+
+  test("does not mutate the input scene", async () => {
+    const input = {
+      width: 900,
+      height: 480,
+      background: null,
+      overlay: null,
+      avatar: null,
+      avatarEllipse: null,
+      texts: [
+        {
+          text: "x",
+          x: 10,
+          y: 10,
+          size: 12,
+          color: "#fff",
+          weight: null,
+        },
+      ],
+    };
+    await renderer.renderAsync(input as unknown as Scene);
+    assert.equal(input.background, null);
+    assert.equal(input.overlay, null);
+    assert.equal(input.texts[0]?.weight, null);
+  });
+
+  test("validates renderer inputs", () => {
+    assert.throws(
+      () => new WelcomeRenderer({ regular: "not a buffer" } as never),
+      (error: unknown) => {
+        assert.ok(error instanceof RenderError);
+        assert.equal(error.code, "INVALID_ARGUMENT");
+        return true;
+      },
+    );
+    assert.throws(
       () =>
-        renderer.renderAsync(
-          scene({ texts: [{ text: "x", x: 10, y: 10, size: 12, color: "red" }] }),
+        new WelcomeRenderer(
+          { regular: Buffer.from("font") },
+          { cacheBytes: -1 },
         ),
       (error: unknown) => {
         assert.ok(error instanceof RenderError);
@@ -389,5 +457,94 @@ describe("WelcomeRenderer", () => {
       }),
     );
     assert.equal(pngInfo(png).width, 900);
+  });
+
+  test("probes PNG and WebP images", () => {
+    assert.deepEqual(probeImage(backgroundPng), {
+      width: 900,
+      height: 480,
+      format: "png",
+      orientation: 1,
+    });
+    assert.deepEqual(probeImage(backgroundWebp), {
+      width: 320,
+      height: 200,
+      format: "webp",
+      orientation: 1,
+    });
+    assert.throws(
+      () => probeImage(Buffer.from("not an image")),
+      (error: unknown) => {
+        assert.ok(error instanceof RenderError);
+        assert.equal(error.code, "IMAGE_DECODE");
+        return true;
+      },
+    );
+  });
+
+  test("normalizes PNG input", async () => {
+    const normalized = await normalizeImage(backgroundPng, {
+      format: "png",
+      maxDimension: 100,
+      maxPixels: 100 * 100,
+      background: "#ffffff",
+    });
+    assert.equal(normalized.format, "png");
+    assert.ok(normalized.width <= 100);
+    assert.ok(normalized.height <= 100);
+    assert.equal(normalized.originalWidth, 900);
+    assert.equal(normalized.originalHeight, 480);
+    assert.deepEqual(
+      [...normalized.data.subarray(0, 8)],
+      [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a],
+    );
+  });
+
+  test("rejects invalid normalization options", async () => {
+    const cases = [{ quality: 0 }, { format: "gif" }] as unknown as NormalizeImageOptions[];
+    for (const options of cases) {
+      await assert.rejects(
+        () => normalizeImage(backgroundPng, options),
+        (error: unknown) => {
+          assert.ok(error instanceof RenderError);
+          assert.equal(error.code, "INVALID_ARGUMENT");
+          return true;
+        },
+      );
+    }
+  });
+
+  test("supports Symbol.asyncDispose via fromFiles", async () => {
+    await using local = await WelcomeRenderer.fromFiles({
+      regular: fontRegular,
+      systemFonts: false,
+      cacheBytes: 0,
+    });
+    const png = await local.renderAsync(scene());
+    assert.equal(pngInfo(png).width, 900);
+  });
+
+  test("disables caching with a zero budget", async () => {
+    using local = await WelcomeRenderer.fromFiles({
+      regular: fontRegular,
+      bold: fontBold,
+      systemFonts: false,
+      cacheBytes: 0,
+    });
+    await local.renderAsync(scene({ backgroundKey: "no-cache" }));
+    await local.renderAsync(scene({ backgroundKey: "no-cache" }));
+    assert.equal(local.stats.cacheEntries, 0);
+    assert.equal(local.stats.cacheHits, 0);
+  });
+
+  test("counts avatar failures", async () => {
+    using local = await WelcomeRenderer.fromFiles({
+      regular: fontRegular,
+      bold: fontBold,
+      systemFonts: false,
+      cacheBytes: 0,
+    });
+    await local.renderAsync(scene({ avatar: Buffer.from("not an image") }));
+    assert.equal(local.stats.avatarFailures, 1);
   });
 });

@@ -62,7 +62,7 @@ function scene(background: Buffer | null, backgroundKey: string, width: number, 
 }
 
 function summary(label: string, times: number[]) {
-  const sorted = [...times].sort((a, b) => a - b);
+  const sorted = times.toSorted((a, b) => a - b);
   const median = sorted[Math.floor(sorted.length / 2)] ?? 0;
   const p95 = sorted[Math.floor(sorted.length * 0.95)] ?? 0;
   return {
@@ -72,7 +72,9 @@ function summary(label: string, times: number[]) {
   };
 }
 
-const runs = Number(process.env.BENCH_RUNS ?? 30);
+const requestedRuns = Number(process.env["BENCH_RUNS"] ?? 30);
+const runs =
+  Number.isInteger(requestedRuns) && requestedRuns > 0 ? requestedRuns : 30;
 
 const renderer = await WelcomeRenderer.fromFiles({
   regular,

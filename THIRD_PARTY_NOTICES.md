@@ -14,6 +14,7 @@ open-source components. All of them are compatible with GPL-3.0-only.
 | `unicode-bidi` | MIT OR Apache-2.0 |
 | `zune-jpeg`, `zune-png`, `zune-core`, `zune-inflate` | MIT OR Apache-2.0 OR Zlib |
 | `image-webp` | MIT OR Apache-2.0 |
+| `jpeg-encoder` | (MIT OR Apache-2.0) AND IJG |
 | `png` | MIT OR Apache-2.0 |
 | `napi`, `napi-derive`, `napi-build`, `napi-sys` | MIT |
 

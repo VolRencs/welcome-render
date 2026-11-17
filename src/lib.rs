@@ -15,11 +15,17 @@ use napi::bindgen_prelude::{AsyncTask, Buffer, Env, Task};
 use napi_derive::napi;
 
 use crate::color::ColorU8;
-use crate::error::RenderError;
+use crate::error::{RenderError, RenderResult};
 use crate::image::{ImageInfo, ImageLimits, probe_image as probe_image_data};
-use crate::normalize::{NormalizeOptions, OutputFormat, normalize_image as normalize_image_data};
-use crate::render::{RendererInner, RendererOptions};
+use crate::normalize::{
+    NormalizeOptions, NormalizedImage, normalize_image as normalize_image_data,
+};
+use crate::png_encode::{OutputFormat, parse_quality};
+use crate::render::{RendererInner, RendererOptions, RendererStats};
 use crate::scene::{EllipseData, OverlayData, SceneData, TextSpecData};
+
+const NORMAL_TEXT_WEIGHT: u32 = 400;
+const BOLD_TEXT_WEIGHT: u32 = 600;
 
 #[napi(object)]
 pub struct NativeFonts {
@@ -150,7 +156,7 @@ impl NativeScene {
                     y: text.y as f32,
                     size: text.size as f32,
                     color: text.color,
-                    bold: text.weight.unwrap_or(400) >= 600,
+                    bold: text.weight.unwrap_or(NORMAL_TEXT_WEIGHT) >= BOLD_TEXT_WEIGHT,
                 })
                 .collect(),
             format: self.format,
@@ -171,26 +177,64 @@ pub struct NativeStats {
     pub avatar_failures: f64,
 }
 
+impl From<RendererStats> for NativeStats {
+    fn from(stats: RendererStats) -> Self {
+        Self {
+            renders: stats.renders as f64,
+            cache_hits: stats.cache_hits as f64,
+            cache_misses: stats.cache_misses as f64,
+            cache_bytes: stats.cache_bytes as f64,
+            cache_entries: stats.cache_entries as f64,
+            background_failures: stats.background_failures as f64,
+            avatar_failures: stats.avatar_failures as f64,
+        }
+    }
+}
+
+impl From<ImageInfo> for NativeImageInfo {
+    fn from(info: ImageInfo) -> Self {
+        Self {
+            width: info.width,
+            height: info.height,
+            format: info.format.to_owned(),
+            orientation: u32::from(info.orientation),
+        }
+    }
+}
+
+impl From<NormalizedImage> for NativeNormalizedImage {
+    fn from(image: NormalizedImage) -> Self {
+        Self {
+            data: Buffer::from(image.data),
+            width: image.width,
+            height: image.height,
+            format: image.format.to_owned(),
+            original_width: image.original_width,
+            original_height: image.original_height,
+            orientation: u32::from(image.orientation),
+        }
+    }
+}
+
+fn catch_napi<T>(context: &str, value: impl FnOnce() -> RenderResult<T>) -> napi::Result<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(value))
+        .map_err(|_| RenderError::internal(format!("{context} panicked")).into_napi())?
+        .map_err(napi::Error::from)
+}
+
 fn parse_normalize_options(
     options: Option<NativeNormalizeOptions>,
 ) -> napi::Result<NormalizeOptions> {
     let defaults = NormalizeOptions::default();
-    let options = match options {
-        Some(options) => options,
-        None => return Ok(defaults),
+    let Some(options) = options else {
+        return Ok(defaults);
     };
-    let format = match options.format {
-        Some(format) => OutputFormat::parse(&format).map_err(napi::Error::from)?,
+    let format = match options.format.as_deref() {
+        Some(format) => OutputFormat::parse(format).map_err(napi::Error::from)?,
         None => defaults.format,
     };
     let quality = match options.quality {
-        Some(quality) if (1..=100).contains(&quality) => quality as u8,
-        Some(quality) => {
-            return Err(
-                RenderError::invalid(format!("quality must be in 1..=100, got {quality}"))
-                    .into_napi(),
-            );
-        }
+        Some(quality) => parse_quality(quality).map_err(napi::Error::from)?,
         None => defaults.quality,
     };
     let background = match options.background {
@@ -205,7 +249,7 @@ fn parse_normalize_options(
         max_pixels: u64::from(
             options
                 .max_pixels
-                .unwrap_or(defaults.max_pixels as u32)
+                .unwrap_or_else(|| u32::try_from(defaults.max_pixels).unwrap_or(u32::MAX))
                 .max(1),
         ),
         format,
@@ -216,10 +260,8 @@ fn parse_normalize_options(
 
 #[napi]
 pub fn probe_image(data: Buffer) -> napi::Result<NativeImageInfo> {
-    let info = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| probe_image_data(&data)))
-        .map_err(|_| RenderError::internal("image probe panicked").into_napi())?
-        .map_err(napi::Error::from)?;
-    Ok(image_info_to_native(info))
+    let info = catch_napi("image probe", || probe_image_data(&data))?;
+    Ok(info.into())
 }
 
 #[napi(ts_return_type = "Promise<NativeNormalizedImage>")]
@@ -232,15 +274,6 @@ pub fn normalize_image(
         data: data.to_vec(),
         options,
     }))
-}
-
-fn image_info_to_native(info: ImageInfo) -> NativeImageInfo {
-    NativeImageInfo {
-        width: info.width,
-        height: info.height,
-        format: info.format.to_owned(),
-        orientation: u32::from(info.orientation),
-    }
 }
 
 #[napi(js_name = "NativeWelcomeRenderer")]
@@ -260,16 +293,14 @@ impl NativeWelcomeRenderer {
             .map(|buffer| buffer.to_vec())
             .collect();
 
-        let inner = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let inner = catch_napi("renderer initialization", || {
             RendererInner::new(
                 fonts.regular.to_vec(),
                 fonts.bold.map(|buffer| buffer.to_vec()),
                 fallback,
                 options,
             )
-        }))
-        .map_err(|_| RenderError::internal("renderer initialization panicked").into_napi())?
-        .map_err(napi::Error::from)?;
+        })?;
 
         Ok(Self {
             inner: Arc::new(inner),
@@ -298,16 +329,7 @@ impl NativeWelcomeRenderer {
 
     #[napi(getter)]
     pub fn stats(&self) -> NativeStats {
-        let stats = self.inner.stats();
-        NativeStats {
-            renders: stats.renders as f64,
-            cache_hits: stats.cache_hits as f64,
-            cache_misses: stats.cache_misses as f64,
-            cache_bytes: stats.cache_bytes as f64,
-            cache_entries: stats.cache_entries as f64,
-            background_failures: stats.background_failures as f64,
-            avatar_failures: stats.avatar_failures as f64,
-        }
+        self.inner.stats().into()
     }
 
     #[napi]
@@ -317,11 +339,7 @@ impl NativeWelcomeRenderer {
 }
 
 fn guarded_render(inner: &RendererInner, scene: &SceneData) -> napi::Result<Vec<u8>> {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| inner.render(scene))) {
-        Ok(Ok(output)) => Ok(output),
-        Ok(Err(error)) => Err(error.into_napi()),
-        Err(_) => Err(RenderError::internal("render panicked").into_napi()),
-    }
+    catch_napi("render", || inner.render(scene))
 }
 
 pub struct RenderTask {
@@ -350,26 +368,16 @@ pub struct NormalizeTask {
 
 #[napi]
 impl Task for NormalizeTask {
-    type Output = crate::normalize::NormalizedImage;
+    type Output = NormalizedImage;
     type JsValue = NativeNormalizedImage;
 
     fn compute(&mut self) -> napi::Result<Self::Output> {
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        catch_napi("image normalization", || {
             normalize_image_data(&self.data, self.options)
-        }))
-        .map_err(|_| RenderError::internal("image normalization panicked").into_napi())?
-        .map_err(napi::Error::from)
+        })
     }
 
     fn resolve(&mut self, _env: Env, output: Self::Output) -> napi::Result<Self::JsValue> {
-        Ok(NativeNormalizedImage {
-            data: Buffer::from(output.data),
-            width: output.width,
-            height: output.height,
-            format: output.format.to_owned(),
-            original_width: output.original_width,
-            original_height: output.original_height,
-            orientation: u32::from(output.orientation),
-        })
+        Ok(output.into())
     }
 }

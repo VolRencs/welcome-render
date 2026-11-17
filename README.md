@@ -2,13 +2,13 @@
 
 Нативный компоновщик сцены для welcome-картинок GOPlay. Не парсит SVG и не
 загружает шрифты на каждый рендер: получает готовые координаты, фон, аватар и
-текст, а возвращает готовый RGB PNG.
+текст, а возвращает готовый RGB PNG или JPEG.
 
 - Rust + N-API 10, только Node.js 26+
 - шрифты загружаются один раз при старте
 - декодированный фон и затемнение кэшируются в native
 - рендер выполняется в libuv thread pool и не блокирует event loop
-- без линковки с fontconfig, C-зависимостей и base64 в горячем пути
+- без C-зависимостей, линковки с fontconfig и base64 в горячем пути
 - один `.node` для `linux-x64-gnu`, без optional-пакетов
 
 ## Установка
@@ -16,7 +16,7 @@
 Пакет распространяется через GitHub Releases:
 
 ```bash
-pnpm add https://github.com/VolRencs/welcome-render/releases/download/v0.1.0/welcome-render-0.1.0.tgz
+pnpm add https://github.com/VolRencs/welcome-render/releases/download/v0.3.0/welcome-render-0.3.0.tgz
 ```
 
 Требования: Linux x64 с glibc и Node.js >= 26.
@@ -98,10 +98,32 @@ const renderer = new WelcomeRenderer(
 
 ### `renderer.renderAsync(scene)`
 
-Основной метод. Возвращает `Promise<Buffer>` с RGB PNG. Работает в libuv
-thread pool, event loop не блокируется.
+Основной метод. Возвращает `Promise<Buffer>` с RGB PNG или JPEG в зависимости
+от `format`. Работает в libuv thread pool, event loop не блокируется.
 
 `renderer.render(scene)` — синхронный вариант для тестов и скриптов.
+
+### `probeImage(data)`
+
+Синхронно читает заголовок PNG/JPEG/WebP и возвращает
+`{ width, height, format, orientation }`. Для JPEG учитывает EXIF orientation.
+
+### `normalizeImage(data, options)`
+
+Декодирует PNG/JPEG/WebP, применяет EXIF orientation, вписывает изображение в
+`maxDimension`/`maxPixels`, заливает прозрачность `background` и кодирует в
+`png` или `jpeg`. Возвращает `{ data, width, height, format, originalWidth,
+originalHeight, orientation }`.
+
+```js
+const normalized = await normalizeImage(buffer, {
+  maxDimension: 2560,
+  maxPixels: 4_000_000,
+  format: "jpeg",
+  quality: 88,
+  background: "#111827",
+});
+```
 
 ### Сцена
 
@@ -114,6 +136,9 @@ thread pool, event loop не блокируется.
 | `avatar` | `Buffer?` | PNG/JPEG/WebP |
 | `avatarEllipse` | `{ cx, cy, rx, ry }?` | эллипс аватара |
 | `texts` | `TextSpec[]` | до 16 текстовых слоёв |
+| `format` | `"png" \| "jpeg" \| "jpg"` | формат выхода, по умолчанию `png` |
+| `quality` | `number?` | качество JPEG 1–100, по умолчанию 90 |
+| `strictBackground` | `boolean?` | вернуть ошибку вместо градиента при битом фоне |
 
 `TextSpec`: `{ text, x, y, size, color, weight? }`. `y` — baseline, `x` —
 центр строки (`text-anchor: middle`). Цвета: `#rgb`, `#rgba`, `#rrggbb`,
@@ -123,36 +148,40 @@ thread pool, event loop не блокируется.
 
 ```js
 renderer.stats;
-// { renders, cacheHits, cacheMisses, cacheBytes, cacheEntries }
+// { renders, cacheHits, cacheMisses, cacheBytes, cacheEntries,
+//   backgroundFailures, avatarFailures }
 
 renderer.clearCache(); // возвращает освобождённые байты
 renderer.dispose();    // то же самое + совместимо с using
 ```
 
 `using renderer = await WelcomeRenderer.fromFiles(...)` работает через
-`Symbol.dispose`.
+`Symbol.dispose`, `await using` — через `Symbol.asyncDispose`.
 
 ### Ошибки
 
 Ошибки приходят как `RenderError` с полем `code`:
 
+- `NATIVE_LOAD`
 - `INVALID_ARGUMENT`
 - `FONT_READ`
 - `FONT_PARSE`
 - `IMAGE_DECODE`
 - `IMAGE_TOO_LARGE`
 - `PNG_ENCODE`
+- `JPEG_ENCODE`
 - `INTERNAL`
 
 Битый фон заменяется градиентом, битый аватар просто не рисуется — welcome-картинка
-всё равно отправляется. Ошибки шрифтов и текста выбрасываются наружу.
+всё равно отправляется. С `strictBackground: true` ошибка фона выбрасывается
+наружу. Ошибки шрифтов и текста выбрасываются всегда.
 
-## Ограничения v0.1.0
+## Ограничения
 
 - только `linux-x64-gnu`, Node.js 26+;
 - PNG/JPEG/WebP; GIF не поддерживается, у анимированных PNG/WebP берётся
   первый кадр;
-- EXIF orientation JPEG пока не применяется;
+- EXIF orientation поддерживается только для JPEG;
 - фон/аватар больше `maxDimension`/`maxPixels` не декодируются: фон
   заменяется градиентом, аватар пропускается;
 - цветные эмодзи не рисуются;
@@ -162,18 +191,18 @@ renderer.dispose();    // то же самое + совместимо с using
 
 ## Производительность
 
-Замер на Ryzen/Arch Linux, Node 26, 15 прогонов, медиана:
+Замер на Ryzen/Arch Linux, Node 26, 50 прогонов, медиана:
 
 | Сценарий | resvg-js (system fonts) | resvg-js (no system fonts) | welcome-render |
 |---|---:|---:|---:|
-| 900×480 | ~140 мс | ~45 мс | **~11 мс** (warm) / ~15 мс (cold) |
-| 1920×1080 PNG-фон | ~270 мс | ~175 мс | **~25 мс** (warm) / ~52 мс (cold) |
-| 1920×1080 JPEG-фон | ~260 мс | ~160 мс | **~24 мс** (warm) / ~43 мс (cold) |
+| 900×480 | ~126 мс | ~40 мс | **~26 мс** (warm) / ~38 мс (cold) |
+| 1920×1080 PNG-фон | ~249 мс | ~163 мс | **~58 мс** (warm) / ~86 мс (cold) |
+| 1920×1080 JPEG-фон | ~237 мс | ~149 мс | **~91 мс** (warm) / ~107 мс (cold) |
 
-Event loop delay во время 20 параллельных рендеров: mean ~10 мс при resolution
-10 мс, то есть заметной блокировки нет.
+Event loop delay во время 20 параллельных рендеров: mean ~10.2 мс при
+resolution 10 мс, то есть заметной блокировки нет.
 
-Размер release-бинарника: ~2.3 МБ. Воспроизвести:
+Размер release-бинарника: ~2.4 МБ. Воспроизвести:
 
 ```bash
 pnpm bench
@@ -183,12 +212,14 @@ BENCH_RUNS=50 pnpm bench
 ## Разработка
 
 ```bash
-rustup toolchain install 1.99.1
+rustup toolchain install 1.100.0
 pnpm install
 pnpm build        # release .node + native.js/native.d.ts
 pnpm test         # node --test, TypeScript без сборки
+pnpm test:rust    # cargo test --lib
 pnpm typecheck    # tsc --noEmit
 pnpm check        # fmt + clippy + typecheck
+pnpm check:all    # check + Rust/JS тесты + сборка
 pnpm bench
 ```
 
@@ -200,8 +231,9 @@ src/
   render.rs       canvas, фон, overlay, аватар
   text.rs         bidi, shaping, glyph outlines
   font.rs         fontdb, fallback-цепочки
-  image.rs        PNG/JPEG/WebP декодеры
-  png_encode.rs   RGB PNG-энкодер
+  image.rs        PNG/JPEG/WebP декодеры и размеры
+  normalize.rs    EXIF, resize, flatten, encode
+  png_encode.rs   PNG/JPEG-энкодеры и формат выхода
   cache.rs        LRU кэш полотен
   scene.rs        внутренние структуры сцены
 index.js          публичный ESM-фасад

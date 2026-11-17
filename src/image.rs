@@ -21,6 +21,42 @@ impl Default for ImageLimits {
     }
 }
 
+pub fn fit_dimensions(width: u32, height: u32, max_dimension: u32, max_pixels: u64) -> (u32, u32) {
+    if width == 0 || height == 0 {
+        return (1, 1);
+    }
+    let max_dimension = u64::from(max_dimension.max(1));
+    let max_pixels = max_pixels.max(1);
+    let pixels = u64::from(width) * u64::from(height);
+
+    if u64::from(width) <= max_dimension
+        && u64::from(height) <= max_dimension
+        && pixels <= max_pixels
+    {
+        return (width, height);
+    }
+
+    let mut scale = 1.0_f64;
+    scale = scale.min(max_dimension as f64 / f64::from(width));
+    scale = scale.min(max_dimension as f64 / f64::from(height));
+    scale = scale.min((max_pixels as f64 / pixels as f64).sqrt());
+
+    let mut out_width = ((f64::from(width) * scale).floor() as u32).max(1);
+    let mut out_height = ((f64::from(height) * scale).floor() as u32).max(1);
+
+    while u64::from(out_width) * u64::from(out_height) > max_pixels {
+        if out_width >= out_height && out_width > 1 {
+            out_width -= 1;
+        } else if out_height > 1 {
+            out_height -= 1;
+        } else {
+            break;
+        }
+    }
+
+    (out_width, out_height)
+}
+
 impl ImageLimits {
     pub fn check(self, width: u32, height: u32) -> RenderResult<()> {
         if width == 0 || height == 0 {
@@ -439,11 +475,12 @@ pub(crate) fn orient_rgba(
         (width, height)
     };
     let mut output = vec![0_u8; rgba.len()];
-    let source_stride = width as usize * 4;
+    let (source, rest) = rgba.as_chunks::<4>();
+    debug_assert!(rest.is_empty(), "RGBA buffer must be pixel aligned");
     let target_stride = out_width as usize * 4;
 
     for y in 0..height as usize {
-        let row = y * source_stride;
+        let row = y * width as usize;
         for x in 0..width as usize {
             let (target_x, target_y) = match orientation {
                 2 => (width as usize - 1 - x, y),
@@ -455,9 +492,9 @@ pub(crate) fn orient_rgba(
                 8 => (y, width as usize - 1 - x),
                 _ => (x, y),
             };
-            let source = row + x * 4;
+            let pixel = &source[row + x];
             let target = target_y * target_stride + target_x * 4;
-            output[target..target + 4].copy_from_slice(&rgba[source..source + 4]);
+            output[target..target + 4].copy_from_slice(pixel);
         }
     }
 
@@ -465,7 +502,9 @@ pub(crate) fn orient_rgba(
 }
 
 fn premultiply(rgba: &mut [u8]) {
-    for pixel in rgba.chunks_exact_mut(4) {
+    let (pixels, rest) = rgba.as_chunks_mut::<4>();
+    debug_assert!(rest.is_empty(), "RGBA buffer must be pixel aligned");
+    for pixel in pixels {
         let alpha = u32::from(pixel[3]);
         if alpha == 255 {
             continue;
@@ -477,34 +516,41 @@ fn premultiply(rgba: &mut [u8]) {
 }
 
 fn rgb_to_rgba(rgb: Vec<u8>) -> Vec<u8> {
-    let mut out = Vec::with_capacity(rgb.len() / 3 * 4);
-    for pixel in rgb.chunks_exact(3) {
-        out.extend_from_slice(pixel);
-        out.push(255);
+    let (pixels, rest) = rgb.as_chunks::<3>();
+    debug_assert!(rest.is_empty(), "RGB buffer must be pixel aligned");
+    let mut out = Vec::with_capacity(pixels.len() * 4);
+    for &[r, g, b] in pixels {
+        out.extend_from_slice(&[r, g, b, 255]);
     }
     out
 }
 
 fn bgr_to_rgba(bgr: Vec<u8>) -> Vec<u8> {
-    let mut out = Vec::with_capacity(bgr.len() / 3 * 4);
-    for pixel in bgr.chunks_exact(3) {
-        out.extend_from_slice(&[pixel[2], pixel[1], pixel[0], 255]);
+    let (pixels, rest) = bgr.as_chunks::<3>();
+    debug_assert!(rest.is_empty(), "BGR buffer must be pixel aligned");
+    let mut out = Vec::with_capacity(pixels.len() * 4);
+    for &[b, g, r] in pixels {
+        out.extend_from_slice(&[r, g, b, 255]);
     }
     out
 }
 
 fn bgra_to_rgba(bgra: Vec<u8>) -> Vec<u8> {
+    let (pixels, rest) = bgra.as_chunks::<4>();
+    debug_assert!(rest.is_empty(), "BGRA buffer must be pixel aligned");
     let mut out = Vec::with_capacity(bgra.len());
-    for pixel in bgra.chunks_exact(4) {
-        out.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
+    for &[b, g, r, a] in pixels {
+        out.extend_from_slice(&[r, g, b, a]);
     }
     out
 }
 
 fn argb_to_rgba(argb: Vec<u8>) -> Vec<u8> {
+    let (pixels, rest) = argb.as_chunks::<4>();
+    debug_assert!(rest.is_empty(), "ARGB buffer must be pixel aligned");
     let mut out = Vec::with_capacity(argb.len());
-    for pixel in argb.chunks_exact(4) {
-        out.extend_from_slice(&[pixel[1], pixel[2], pixel[3], pixel[0]]);
+    for &[a, r, g, b] in pixels {
+        out.extend_from_slice(&[r, g, b, a]);
     }
     out
 }
@@ -518,9 +564,11 @@ fn luma_to_rgba(luma: Vec<u8>) -> Vec<u8> {
 }
 
 fn luma_alpha_to_rgba(luma_alpha: Vec<u8>) -> Vec<u8> {
-    let mut out = Vec::with_capacity(luma_alpha.len() / 2 * 4);
-    for pixel in luma_alpha.chunks_exact(2) {
-        out.extend_from_slice(&[pixel[0], pixel[0], pixel[0], pixel[1]]);
+    let (pixels, rest) = luma_alpha.as_chunks::<2>();
+    debug_assert!(rest.is_empty(), "luma-alpha buffer must be pixel aligned");
+    let mut out = Vec::with_capacity(pixels.len() * 4);
+    for &[luma, alpha] in pixels {
+        out.extend_from_slice(&[luma, luma, luma, alpha]);
     }
     out
 }
@@ -537,6 +585,19 @@ mod tests {
     #[test]
     fn rejects_unknown_format() {
         assert!(decode_image(b"definitely not an image", ImageLimits::default()).is_err());
+    }
+
+    #[test]
+    fn fits_dimensions() {
+        assert_eq!(fit_dimensions(900, 480, 2560, 4_000_000), (900, 480));
+        assert_eq!(fit_dimensions(6000, 4000, 2560, 4_000_000), (2449, 1632));
+        assert_eq!(fit_dimensions(2560, 2560, 2560, 4_000_000), (2000, 2000));
+        assert_eq!(fit_dimensions(0, 10, 4096, 16_777_216), (1, 1));
+        assert_eq!(fit_dimensions(1920, 1080, 320, u64::MAX), (320, 180));
+        assert_eq!(fit_dimensions(8000, 4000, 4096, u64::MAX), (4096, 2048));
+        assert_eq!(fit_dimensions(20, 20, 4096, 100), (10, 10));
+        let (width, height) = fit_dimensions(8000, 4000, 4096, 1_000_000);
+        assert!(u64::from(width) * u64::from(height) <= 1_000_000);
     }
 
     #[test]
@@ -576,5 +637,19 @@ mod tests {
             rotated,
             vec![3, 0, 0, 255, 1, 0, 0, 255, 4, 0, 0, 255, 2, 0, 0, 255]
         );
+    }
+
+    #[test]
+    fn orientation_swaps_dimensions_only_for_transposed_values() {
+        for orientation in 1..=8 {
+            let pixels = vec![0_u8; 2 * 3 * 4];
+            let (_, width, height) = orient_rgba(pixels, 2, 3, orientation);
+            let expected = if (5..=8).contains(&orientation) {
+                (3, 2)
+            } else {
+                (2, 3)
+            };
+            assert_eq!((width, height), expected, "orientation {orientation}");
+        }
     }
 }

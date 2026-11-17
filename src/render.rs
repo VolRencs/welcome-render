@@ -9,9 +9,10 @@ use crate::cache::PixmapCache;
 use crate::color::ColorU8;
 use crate::error::{RenderError, RenderResult};
 use crate::font::FontStore;
-use crate::image::{DecodedImage, ImageLimits, decode_image};
-use crate::normalize::OutputFormat;
-use crate::png_encode::{encode_rgb_jpeg_pixmap, encode_rgb_png_pixmap};
+use crate::image::{DecodedImage, ImageLimits, decode_image, fit_dimensions};
+use crate::png_encode::{
+    OutputFormat, encode_rgb_jpeg_pixmap, encode_rgb_png_pixmap, parse_quality,
+};
 use crate::scene::{EllipseData, SceneData};
 use crate::text::TextEngine;
 
@@ -118,7 +119,7 @@ impl RendererInner {
         if width == 0 || height == 0 {
             return Err(RenderError::invalid("canvas dimensions must be positive"));
         }
-        let (width, height) = fit_to_limits(
+        let (width, height) = fit_dimensions(
             width,
             height,
             self.limits.max_dimension,
@@ -370,42 +371,6 @@ impl RendererInner {
     }
 }
 
-fn fit_to_limits(width: u32, height: u32, max_dimension: u32, max_pixels: u64) -> (u32, u32) {
-    if width == 0 || height == 0 {
-        return (1, 1);
-    }
-    let max_dimension = u64::from(max_dimension.max(1));
-    let max_pixels = max_pixels.max(1);
-    let pixels = u64::from(width) * u64::from(height);
-
-    if u64::from(width) <= max_dimension
-        && u64::from(height) <= max_dimension
-        && pixels <= max_pixels
-    {
-        return (width, height);
-    }
-
-    let mut scale = 1.0_f64;
-    scale = scale.min(max_dimension as f64 / f64::from(width));
-    scale = scale.min(max_dimension as f64 / f64::from(height));
-    scale = scale.min((max_pixels as f64 / pixels as f64).sqrt());
-
-    let mut out_width = ((f64::from(width) * scale).floor() as u32).max(1);
-    let mut out_height = ((f64::from(height) * scale).floor() as u32).max(1);
-
-    while u64::from(out_width) * u64::from(out_height) > max_pixels {
-        if out_width >= out_height && out_width > 1 {
-            out_width -= 1;
-        } else if out_height > 1 {
-            out_height -= 1;
-        } else {
-            break;
-        }
-    }
-
-    (out_width, out_height)
-}
-
 fn overlay_params(scene: &SceneData) -> RenderResult<(ColorU8, f32)> {
     match &scene.overlay {
         Some(overlay) => {
@@ -445,33 +410,30 @@ fn strict_background_error(scene: &SceneData, error: Option<RenderError>) -> Ren
 }
 
 fn output_format(scene: &SceneData) -> RenderResult<OutputFormat> {
-    match scene.format.as_deref() {
-        None | Some("png") => Ok(OutputFormat::Png),
-        Some("jpeg" | "jpg") => Ok(OutputFormat::Jpeg),
-        Some(other) => Err(RenderError::invalid(format!(
-            "unsupported output format {other:?}"
-        ))),
-    }
+    scene
+        .format
+        .as_deref()
+        .map_or(Ok(OutputFormat::Png), OutputFormat::parse)
 }
 
 fn output_quality(scene: &SceneData) -> RenderResult<u8> {
-    match scene.quality {
-        None => Ok(90),
-        Some(quality) if (1..=100).contains(&quality) => Ok(quality as u8),
-        Some(quality) => Err(RenderError::invalid(format!(
-            "quality must be in 1..=100, got {quality}"
-        ))),
-    }
+    parse_quality(scene.quality.unwrap_or(90))
 }
 
 fn composite_background_exact(canvas: &mut Pixmap, background: &DecodedImage) {
     let data = canvas.data_mut();
+    let (source_pixels, source_rest) = background.rgba.as_chunks::<4>();
+    let (target_pixels, target_rest) = data.as_chunks_mut::<4>();
+    debug_assert!(source_rest.is_empty(), "background must be pixel aligned");
+    debug_assert!(target_rest.is_empty(), "canvas must be pixel aligned");
+    debug_assert_eq!(
+        source_pixels.len(),
+        target_pixels.len(),
+        "background and canvas sizes must match"
+    );
+
     let base = ColorU8::BASE;
-    for (source, target) in background
-        .rgba
-        .chunks_exact(4)
-        .zip(data.chunks_exact_mut(4))
-    {
+    for (source, target) in source_pixels.iter().zip(target_pixels) {
         let alpha = u32::from(source[3]);
         if alpha == 255 {
             target.copy_from_slice(source);
@@ -525,8 +487,11 @@ fn apply_overlay(canvas: &mut Pixmap, color: ColorU8, opacity: f32) {
     }
     let inverse = 255 - alpha;
 
+    let (pixels, rest) = canvas.data_mut().as_chunks_mut::<4>();
+    debug_assert!(rest.is_empty(), "canvas must be pixel aligned");
+
     if color.r == 0 && color.g == 0 && color.b == 0 {
-        for pixel in canvas.data_mut().chunks_exact_mut(4) {
+        for pixel in pixels {
             pixel[0] = ((u32::from(pixel[0]) * inverse + 127) / 255) as u8;
             pixel[1] = ((u32::from(pixel[1]) * inverse + 127) / 255) as u8;
             pixel[2] = ((u32::from(pixel[2]) * inverse + 127) / 255) as u8;
@@ -535,7 +500,7 @@ fn apply_overlay(canvas: &mut Pixmap, color: ColorU8, opacity: f32) {
         return;
     }
 
-    for pixel in canvas.data_mut().chunks_exact_mut(4) {
+    for pixel in pixels {
         pixel[0] = ((u32::from(pixel[0]) * inverse + u32::from(color.r) * alpha + 127) / 255) as u8;
         pixel[1] = ((u32::from(pixel[1]) * inverse + u32::from(color.g) * alpha + 127) / 255) as u8;
         pixel[2] = ((u32::from(pixel[2]) * inverse + u32::from(color.b) * alpha + 127) / 255) as u8;
@@ -550,25 +515,6 @@ fn lerp_u8(from: u8, to: u8, t: f32) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn keeps_canvas_that_fits() {
-        assert_eq!(fit_to_limits(900, 480, 4096, 16_777_216), (900, 480));
-        assert_eq!(fit_to_limits(0, 10, 4096, 16_777_216), (1, 1));
-    }
-
-    #[test]
-    fn clamps_by_dimension() {
-        assert_eq!(fit_to_limits(1920, 1080, 320, u64::MAX), (320, 180));
-        assert_eq!(fit_to_limits(8000, 4000, 4096, u64::MAX), (4096, 2048));
-    }
-
-    #[test]
-    fn clamps_by_pixel_budget() {
-        assert_eq!(fit_to_limits(20, 20, 4096, 100), (10, 10));
-        let (width, height) = fit_to_limits(8000, 4000, 4096, 1_000_000);
-        assert!(u64::from(width) * u64::from(height) <= 1_000_000);
-    }
 
     #[test]
     fn gradient_row_is_opaque() {
